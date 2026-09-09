@@ -9,6 +9,35 @@ Action = Literal["restart_service", "rollback_release", "restore_config", "rotat
 ACTIONS = {"restart_service", "rollback_release", "restore_config", "rotate_logs"}
 
 
+class HttpProbe(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    timeout_seconds: float = Field(default=5, ge=1, le=30)
+    expected_status: int | None = Field(default=None, ge=100, le=599)
+    body_contains: str = Field(default="", max_length=500)
+
+
+class ResourceRule(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    metric: Literal["latency_ms", "cpu_percent", "memory_percent", "disk_percent"]
+    above: float = Field(gt=0, le=60000)
+    recover_below: float = Field(ge=0, le=60000)
+    for_checks: int = Field(default=3, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def ordered_thresholds(self):
+        if self.recover_below >= self.above:
+            raise ValueError("恢复阈值必须低于触发阈值")
+        if self.metric != "latency_ms" and self.above > 100:
+            raise ValueError("使用率阈值不能超过 100%")
+        return self
+
+
+def unique_rules(rules):
+    if len({rule.metric for rule in rules}) != len(rules):
+        raise ValueError("同一指标只能配置一条预警规则")
+    return rules
+
+
 class HealthCheck(BaseModel):
     name: str = Field(max_length=200)
     ok: StrictBool
@@ -39,6 +68,10 @@ class ServiceCreate(BaseModel):
     agent_service: str = Field(default="", max_length=80, pattern=r"^[a-zA-Z0-9_.-]*$")
     agent_token: str = Field(default="", max_length=4096)
     enabled: bool = True
+    http_probe: HttpProbe = Field(default_factory=HttpProbe)
+    resource_rules: list[ResourceRule] = Field(default_factory=list, max_length=4)
+
+    _unique_rules = field_validator("resource_rules")(unique_rules)
 
     @field_validator("name")
     @classmethod
@@ -67,6 +100,10 @@ class ServiceCreate(BaseModel):
             raise ValueError("HTTP 监测不具备执行权限，请接入主机 Agent")
         if self.connector == "agent" and (not self.agent_service or not self.agent_token):
             raise ValueError("主机 Agent 需要服务标识和访问令牌")
+        if self.connector != "agent" and any(rule.metric != "latency_ms" for rule in self.resource_rules):
+            raise ValueError("主机资源预警需要接入 Linux 主机 Agent")
+        if self.connector != "http" and self.http_probe != HttpProbe():
+            raise ValueError("HTTP 探测契约仅适用于 HTTP 连接器")
         self.auto_actions = list(dict.fromkeys(self.auto_actions))
         return self
 
@@ -77,6 +114,31 @@ class ServicePatch(BaseModel):
     enabled: bool | None = None
     interval_seconds: int | None = Field(default=None, ge=5, le=3600)
     auto_actions: list[Action] | None = None
+    http_probe: HttpProbe | None = None
+    resource_rules: list[ResourceRule] | None = Field(default=None, max_length=4)
+
+    @field_validator("resource_rules")
+    @classmethod
+    def distinct_metrics(cls, value):
+        return unique_rules(value) if value is not None else value
+
+
+class MaintenanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    minutes: int = Field(ge=1, le=10080)
+    reason: str = Field(min_length=1, max_length=300)
+
+    @field_validator("reason")
+    @classmethod
+    def meaningful_reason(cls, value):
+        if not value.strip():
+            raise ValueError("请输入维护原因")
+        return value.strip()
+
+
+class AlertAcknowledge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    note: str = Field(default="已查看，将继续跟踪", min_length=1, max_length=500)
 
 
 class FaultRequest(BaseModel):

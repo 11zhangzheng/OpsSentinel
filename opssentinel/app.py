@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,9 +19,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from . import __version__
 from .connectors import ConnectorManager
 from .engine import Conflict, Engine
-from .models import DismissRequest, FaultRequest, ServiceCreate, ServicePatch
+from .models import AlertAcknowledge, DismissRequest, FaultRequest, HttpProbe, MaintenanceRequest, ServiceCreate, ServicePatch
 from .process_lock import ProcessLock
-from .store import Store
+from .store import Store, now
 
 
 def public_service(service):
@@ -118,6 +118,8 @@ def create_app(*, data_dir: Path | str = ".opssentinel", demo=False, api_token=N
         response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
+        elif request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
     @application.exception_handler(RequestValidationError)
@@ -160,7 +162,7 @@ def create_app(*, data_dir: Path | str = ".opssentinel", demo=False, api_token=N
                 raise HTTPException(409, "这个服务已接入")
         service = store.add_service(body.model_dump())
         store.event("service_added", f"接入服务：{service['name']}", service["id"])
-        return public_service(service)
+        return request.app.state.engine.service_view(service)
 
     @application.patch("/api/services/{sid}")
     async def patch_service(sid: str, body: ServicePatch, request: Request):
@@ -169,16 +171,45 @@ def create_app(*, data_dir: Path | str = ".opssentinel", demo=False, api_token=N
             service = engine.store.get_service(sid)
             if not service:
                 raise KeyError(sid)
-            changes = body.model_dump(exclude_none=True)
+            changes = {key: value for key, value in body.model_dump().items() if value is not None}
             if "name" in changes:
                 changes["name"] = changes["name"].strip()
                 if not changes["name"]:
                     raise HTTPException(422, "服务名称不能为空")
             if service["connector"] == "http" and changes.get("auto_actions"):
                 raise HTTPException(422, "HTTP 连接器只提供监测")
+            if service["connector"] != "agent" and any(rule["metric"] != "latency_ms" for rule in changes.get("resource_rules", [])):
+                raise HTTPException(422, "主机资源预警需要接入 Linux 主机 Agent")
+            if service["connector"] != "http" and "http_probe" in changes and changes["http_probe"] != HttpProbe().model_dump():
+                raise HTTPException(422, "HTTP 探测契约仅适用于 HTTP 连接器")
+            invalidate = ("http_probe" in changes and changes["http_probe"] != service["http_probe"]) or (changes.get("enabled") is True and not service["enabled"])
             service = engine.store.patch_service(sid, changes)
+            if invalidate:
+                engine.store.reset_check_counts(sid, invalidate=True)
+                service = engine.store.get_service(sid)
             engine.store.event("policy_changed", "服务设置已更新：" + "、".join(changes), sid)
-            return public_service(service)
+            return engine.service_view(service)
+
+    @application.get("/api/services/{sid}/history")
+    async def history(sid: str, request: Request, hours: int = Query(default=24)):
+        store = request.app.state.store
+        if not store.get_service(sid):
+            raise KeyError(sid)
+        if hours not in {1, 24, 168}:
+            raise HTTPException(422, "历史窗口可选 1、24 或 168 小时")
+        return store.history(sid, hours)
+
+    @application.post("/api/services/{sid}/maintenance")
+    async def start_maintenance(sid: str, body: MaintenanceRequest, request: Request):
+        return await request.app.state.engine.maintenance(sid, minutes=body.minutes, reason=body.reason)
+
+    @application.delete("/api/services/{sid}/maintenance")
+    async def end_maintenance(sid: str, request: Request):
+        return await request.app.state.engine.maintenance(sid)
+
+    @application.post("/api/resource-alerts/{aid}/acknowledge")
+    async def acknowledge(aid: str, body: AlertAcknowledge, request: Request):
+        return request.app.state.store.acknowledge_resource_alert(aid, body.note, now())
 
     @application.post("/api/services/{sid}/scan")
     async def scan_service(sid: str, request: Request):

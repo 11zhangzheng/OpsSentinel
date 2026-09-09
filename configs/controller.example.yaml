@@ -8,6 +8,15 @@ services:
     interval_seconds: 15
     failure_threshold: 2
     recovery_threshold: 2
+    http_probe:
+      timeout_seconds: 5
+      expected_status: null # null keeps any 2xx; use 200/204 for an exact contract.
+      body_contains: "" # Optional literal UTF-8 text, e.g. ready. Never stored in probe evidence.
+    resource_rules:
+      - metric: latency_ms
+        above: 1000
+        recover_below: 800
+        for_checks: 3
     auto_actions: []
     enabled: false
 

@@ -16,6 +16,14 @@ import httpx
 MAX_BODY = 65536
 
 
+class ResponseTooLargeError(ValueError):
+    """A received HTTP response exceeded the bounded probe payload."""
+
+    def __init__(self, status_code: int):
+        super().__init__("HTTP response exceeds the 64 KiB limit")
+        self.status_code = status_code
+
+
 def validate_http_url(value: str) -> str:
     if not isinstance(value, str) or len(value) > 2048 or any(ord(c) < 33 for c in value):
         raise ValueError("HTTP target must be a nonempty URL without whitespace")
@@ -76,13 +84,14 @@ async def http_request(url: str, *, method: str = "GET", token: str | None = Non
                                      follow_redirects=False, trust_env=False) as client:
             async with client.stream(method, url, headers=headers, json=payload) as response:
                 chunks = bytearray()
-                async for chunk in response.aiter_bytes():
+                async for chunk in response.aiter_bytes(chunk_size=8192):
                     chunks.extend(chunk[:MAX_BODY + 1 - len(chunks)])
                     if len(chunks) > MAX_BODY:
-                        raise ValueError("HTTP response exceeds the 64 KiB limit")
+                        raise ResponseTooLargeError(response.status_code)
                 return response.status_code, bytes(chunks)
 
-    return await asyncio.wait_for(request(), timeout=timeout + 1)
+    # Include connection, response headers and all body reads in one deadline.
+    return await asyncio.wait_for(request(), timeout=timeout)
 
 
 def bounded_command(args: list[str], *, timeout: float = 15, limit: int = 65536) -> dict:

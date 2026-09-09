@@ -11,9 +11,10 @@ import time
 from urllib.parse import quote
 import uuid
 
+import httpx
 import psutil
 
-from .connector_helpers import atomic_json, http_request, tail_lines, validate_agent_base
+from .connector_helpers import ResponseTooLargeError, atomic_json, http_request, tail_lines, validate_agent_base
 from .demo_service import LOG_LIMIT
 
 ACTIONS = {"restart_service", "rollback_release", "restore_config", "rotate_logs"}
@@ -135,7 +136,9 @@ class ConnectorManager:
                 result["facts"] = {"suggested_action": "restart_service", "exercise": True}
                 result["logs"] = tail_lines(self.demo_dir / "application.log")
                 return result
-            target = self._target if connector == "demo" else service["target"]
+            if connector == "http":
+                return await self._observe_http(service)
+            target = self._target
             code, body = await http_request(target)
             result = {"healthy": 200 <= code < 300, "reachable": True,
                       "summary": f"HTTP health probe returned {code}",
@@ -153,6 +156,50 @@ class ConnectorManager:
         except Exception as exc:
             # Never return raw exception URLs/headers, which may contain secrets.
             return failure(f"Probe failed ({type(exc).__name__})")
+
+    async def _observe_http(self, service: dict) -> dict:
+        """Evaluate an explicit HTTP contract without retaining response content."""
+        probe = service.get("http_probe") or {}
+        timeout = probe.get("timeout_seconds", 5.0)
+        expected = probe.get("expected_status")
+        contains = probe.get("body_contains", "")
+        # Service models validate persisted configuration. Keep this boundary safe
+        # for direct connector use and older/custom service stores as well.
+        if (not isinstance(timeout, (float, int)) or isinstance(timeout, bool) or not 1 <= timeout <= 30
+                or (expected is not None and (not isinstance(expected, int) or isinstance(expected, bool) or not 100 <= expected <= 599))
+                or not isinstance(contains, str) or len(contains) > 500):
+            return failure("HTTP probe configuration is invalid")
+        started = time.monotonic()
+        try:
+            code, body = await http_request(service["target"], timeout=float(timeout))
+            status_ok = code == expected if expected is not None else 200 <= code < 300
+            expected_detail = str(expected) if expected is not None else "2xx"
+            checks = [{"name": "http", "ok": status_ok, "detail": f"HTTP {code}; expected {expected_detail}"}]
+            if contains:
+                # Literal UTF-8 matching; neither the response nor the configured
+                # match string is copied into observations, evidence or model logs.
+                matched = contains.encode("utf-8") in body
+                checks.append({"name": "response_body", "ok": matched,
+                               "detail": "Required content matched" if matched else "Required content was not found"})
+            healthy = all(check["ok"] for check in checks)
+            problems = ["status code" if check["name"] == "http" else "required content" for check in checks if not check["ok"]]
+            summary = f"HTTP contract passed (HTTP {code})" if healthy else "HTTP contract failed: " + ", ".join(problems)
+            return {"healthy": healthy, "reachable": True, "summary": summary,
+                    "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                    "checks": checks, "metrics": {}, "logs": [], "facts": {}}
+        except ResponseTooLargeError as exc:
+            return {"healthy": False, "reachable": True, "summary": "HTTP response exceeded the 64 KiB probe limit",
+                    "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                    "checks": [{"name": "response_size", "ok": False,
+                                "detail": f"HTTP {exc.status_code}; response exceeded 64 KiB"}],
+                    "metrics": {}, "logs": [], "facts": {}}
+        except (TimeoutError, httpx.TimeoutException):
+            observation = failure(f"HTTP probe exceeded the {float(timeout):g} second timeout")
+            observation["checks"][0]["name"] = "timeout"
+            observation["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+            return observation
+        except Exception as exc:
+            return failure(f"HTTP connection probe failed ({type(exc).__name__})")
 
     async def execute(self, service: dict, action: str) -> dict:
         if action not in ACTIONS:

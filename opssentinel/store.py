@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .telemetry import TelemetryMixin, maintenance_active
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -17,7 +19,7 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
-class Store:
+class Store(TelemetryMixin):
     """Small synchronous transactions; no database transaction spans a tool call."""
 
     def __init__(self, path: Path):
@@ -49,6 +51,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS actions_incident ON actions(incident_id);
         """)
         self.db.commit()
+        self.init_telemetry()
 
     def close(self):
         with self.lock:
@@ -66,7 +69,9 @@ class Store:
     def get_service(self, sid: str) -> dict | None:
         with self.lock:
             row = self.db.execute("SELECT * FROM services WHERE id=?", (sid,)).fetchone()
-        return {"id": row["id"], **json.loads(row["config"]), **json.loads(row["state"])} if row else None
+        defaults = {"http_probe": {"timeout_seconds": 5, "expected_status": None, "body_contains": ""},
+                    "resource_rules": [], "maintenance_until": None, "maintenance_reason": ""}
+        return {"id": row["id"], **defaults, **json.loads(row["config"]), **json.loads(row["state"])} if row else None
 
     def list_services(self) -> list[dict]:
         with self.lock:
@@ -80,7 +85,20 @@ class Store:
                 raise KeyError(sid)
             config = {**json.loads(row[0]), **changes}
             self.db.execute("UPDATE services SET config=? WHERE id=?", (json.dumps(config), sid))
+            if "resource_rules" in changes:
+                self.sync_resource_rules(sid, changes["resource_rules"], now())
         return self.get_service(sid)
+
+    def reset_check_counts(self, sid, *, invalidate=False):
+        with self.lock, self.db:
+            row = self.db.execute("SELECT state FROM services WHERE id=?", (sid,)).fetchone()
+            if not row:
+                raise KeyError(sid)
+            state = {**json.loads(row[0]), "consecutive_failures": 0, "consecutive_successes": 0}
+            if invalidate:
+                state.update(health="unknown", last_check_at=None, latest=None, next_check_at=None)
+            self.db.execute("UPDATE services SET state=? WHERE id=?", (json.dumps(state), sid))
+            self.db.execute("DELETE FROM resource_states WHERE service_id=?", (sid,))
 
     def record_observation(self, sid: str, snapshot: dict) -> dict:
         stamp = now()
@@ -93,8 +111,9 @@ class Store:
                          consecutive_failures=0 if healthy else state["consecutive_failures"] + 1,
                          consecutive_successes=state.get("consecutive_successes", 0) + 1 if healthy else 0)
             self.db.execute("UPDATE services SET state=? WHERE id=?", (json.dumps(state), sid))
-            self.db.execute("INSERT INTO observations(service_id,created_at,document) VALUES(?,?,?)",
+            cursor = self.db.execute("INSERT INTO observations(service_id,created_at,document) VALUES(?,?,?)",
                             (sid, stamp, json.dumps(snapshot)))
+            self.record_telemetry(cursor.lastrowid, sid, stamp, snapshot, maintenance_active(self.get_service(sid)))
             self.db.execute("DELETE FROM observations WHERE service_id=? AND seq NOT IN "
                             "(SELECT seq FROM observations WHERE service_id=? ORDER BY seq DESC LIMIT 200)", (sid, sid))
         return self.get_service(sid)

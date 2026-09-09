@@ -18,7 +18,7 @@ def context_key(snapshot: dict) -> str:
     facts = snapshot.get("facts", {})
     stable = {k: facts.get(k) for k in ("suggested_action", "current_image", "previous_image",
                                        "expected_current_image", "container_created_at", "known_good_config_hash",
-                                       "config_changed", "config_hash", "release", "fault") if k in facts}
+                                       "config_changed", "config_hash", "release", "fault", "allowed_actions") if k in facts}
     return hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:20]
 
 
@@ -36,6 +36,9 @@ class Analyzer:
         action = snapshot.get("facts", {}).get("suggested_action")
         if action not in ACTIONS or service["connector"] == "http":
             action = None
+        allowed = snapshot.get("facts", {}).get("allowed_actions")
+        if service["connector"] == "agent" and allowed is not None and (not isinstance(allowed, list) or action not in allowed):
+            action = None
         reason = snapshot.get("summary", "健康检查未通过")
         if action:
             reason += f"。连接器提供了 {ACTION_NAMES[action]} 的处置线索；执行层还将检查前置条件，恢复必须由后续探针确认。"
@@ -48,6 +51,11 @@ class Analyzer:
         if not self.enabled:
             return fallback
         safe_service = {k: v for k, v in service.items() if k not in {"agent_token", "latest"}}
+        if "http_probe" in safe_service:
+            probe = safe_service["http_probe"]
+            safe_service["http_probe"] = {"timeout_seconds": probe.get("timeout_seconds", 5),
+                                          "expected_status": probe.get("expected_status"),
+                                          "body_match_configured": bool(probe.get("body_contains"))}
         context = redact({"get_snapshot": snapshot, "get_service_policy": safe_service,
                           "get_recent_logs": snapshot.get("logs", [])[-60:],
                           "get_recent_incidents": incidents[:5]}, (service.get("agent_token", ""), self.api_key))

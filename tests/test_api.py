@@ -8,6 +8,14 @@ TOKEN = "controller-test-token-with-32-characters"
 HEADERS = {"X-OpsSentinel-Request": "dashboard"}
 
 
+def test_dashboard_assets_are_revalidated_after_upgrade(client):
+    page = client.get("/")
+    assert page.status_code == 200
+    assert page.headers["cache-control"] == "no-cache"
+    assert "/static/app.js?v=0.2.0" in page.text
+    assert client.get("/static/app.js?v=0.2.0").headers["cache-control"] == "no-cache"
+
+
 @pytest.fixture
 def client(tmp_path):
     with TestClient(create_app(data_dir=tmp_path, schedule=False, api_token="")) as client:

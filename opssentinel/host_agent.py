@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -156,6 +157,9 @@ class HostRuntime:
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.database = self.state_dir / "operations.sqlite3"
         self._locks = {identifier: threading.Lock() for identifier in self.services}
+        self._metrics_lock = asyncio.Lock()
+        self._metrics_sample: dict = {}
+        self._metrics_sample_at = 0.0
         with self._db() as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS operations (operation_id TEXT PRIMARY KEY, service_id TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, result TEXT, created_at REAL NOT NULL)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_started_action_per_service ON operations(service_id) WHERE status='started'")
@@ -250,20 +254,44 @@ class HostRuntime:
         except (ValueError, TypeError, KeyError):
             return {"eligible": False, "reason": "Container creation time is unavailable"}
 
+    async def _host_metrics(self) -> dict:
+        """Share a real interval CPU sample between concurrent service probes."""
+        async with self._metrics_lock:
+            if not self._metrics_sample or time.monotonic() - self._metrics_sample_at >= 1.0:
+                def sample() -> dict:
+                    # The blocking interval runs in a worker, never on the event
+                    # loop. Nonblocking cpu_percent() is thread-local and repeated
+                    # service probes otherwise reset its baseline to a tiny span.
+                    values = {}
+                    readers = {"cpu_percent": lambda: psutil.cpu_percent(interval=0.2),
+                               "memory_percent": lambda: psutil.virtual_memory().percent,
+                               "disk_percent": lambda: psutil.disk_usage(str(self.state_dir)).percent}
+                    for name, read in readers.items():
+                        try:
+                            value = read()
+                            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 100:
+                                values[name] = value
+                        except (OSError, RuntimeError, ValueError, AttributeError):
+                            # Missing telemetry is not proof of a service failure;
+                            # omit it so history and alert streaks record a gap.
+                            pass
+                    return values
+                self._metrics_sample = await asyncio.to_thread(sample)
+                self._metrics_sample_at = time.monotonic()
+            return dict(self._metrics_sample)
+
     async def observe(self, identifier: str) -> dict:
         service = self._service(identifier)
         started = time.monotonic()
-        calls = [asyncio.to_thread(self._container, service), self._probe("health_http", service["health_url"])]
+        calls = [asyncio.to_thread(self._container, service), self._host_metrics(), self._probe("health_http", service["health_url"])]
         if service.get("business_url"):
             calls.append(self._probe("business_http", service["business_url"]))
         values = await asyncio.gather(*calls)
-        container, *probes = values
+        container, metrics, *probes = values
         checks = [{"name": "container", "ok": container.get("known") is True and container.get("running") is True,
                    "detail": container["summary"]}, *[{key: item[key] for key in ("name", "ok", "detail")} for item in probes]]
         if container.get("docker_health"):
             checks.append({"name": "docker_health", "ok": container["docker_health"] == "healthy", "detail": container["docker_health"]})
-        metrics = {"cpu_percent": psutil.cpu_percent(), "memory_percent": psutil.virtual_memory().percent,
-                   "disk_percent": psutil.disk_usage(str(self.state_dir)).percent}
         if service.get("managed_log_path"):
             log = Path(service["managed_log_path"])
             try:
@@ -302,9 +330,9 @@ class HostRuntime:
                 facts["suggested_action"] = "restore_config"
             elif rollback_evidence["eligible"] and any(probe["name"] == "business_http" and not probe["ok"] for probe in probes) and "rollback_release" in service["allowed_actions"]:
                 facts["suggested_action"] = "rollback_release"
-            elif metrics.get("log_bytes", 0) > service["max_log_bytes"]:
+            elif metrics.get("log_bytes", 0) > service["max_log_bytes"] and "rotate_logs" in service["allowed_actions"]:
                 facts["suggested_action"] = "rotate_logs"
-            elif container.get("known") and container.get("exists") and (not container.get("running") or container.get("docker_health") == "unhealthy"):
+            elif container.get("known") and container.get("exists") and (not container.get("running") or container.get("docker_health") == "unhealthy") and "restart_service" in service["allowed_actions"]:
                 facts["suggested_action"] = "restart_service"
         return {"healthy": healthy, "reachable": any(probe["reachable"] for probe in probes),
                 "summary": "Configured host service healthy" if healthy else "Configured host service failed health checks",
