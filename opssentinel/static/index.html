@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0e192c"><title>OpsSentinel · 运维工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%230e192c'/%3E%3Cpath d='M20 6l12 5v9c0 7-7 12-12 14C15 32 8 27 8 20v-9z' fill='%2339d6ad'/%3E%3Cpath d='M13 20l5 5 10-11' fill='none' stroke='%230e192c' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-icon">◈</span><span>OpsSentinel<small>自主运维工作台</small></span></a>
+    <div class="workspace"><span class="workspace-icon">O</span><div>本地工作空间<small id="workspaceMode">正在连接控制器</small></div><span class="workspace-dot"></span></div>
+    <div class="nav-label">工作空间</div>
+    <nav aria-label="主导航">
+      <button class="nav-item active" data-view="overview"><span>◫</span>值班概览</button>
+      <button class="nav-item" data-view="services"><span>▤</span>受管服务<span class="nav-count" id="navServiceCount">—</span></button>
+      <button class="nav-item" data-view="incidents"><span>⌁</span>事故中心<span class="nav-count" id="navIncidentCount">—</span></button>
+      <button class="nav-item" data-view="exercise"><span>◇</span>故障演练</button>
+    </nav>
+    <div class="sidebar-bottom"><div class="guard-mark">✓</div><strong>每一次恢复，都有依据</strong><p>持续观测 · 受控处置<br>业务验证 · 完整记录</p><button class="text-button" id="tokenOpen">设置访问令牌 →</button><div class="sidebar-version" id="sidebarVersion">OPSSENTINEL / 0.1.0</div></div>
+  </aside>
+  <div class="main-shell">
+    <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> <strong id="breadcrumbView">值班概览</strong></div><div class="topbar-right"><span id="connectionStatus" class="connection pending">连接中</span><span class="top-divider"></span><time id="localTime">—</time><span class="avatar">OP</span></div></header>
+    <main>
+      <section class="page-heading"><div><div class="eyebrow">OPERATIONS, WITH EVIDENCE</div><h1 id="pageTitle">让服务持续在线</h1><p id="pageDescription">发现异常、调查原因、验证恢复。每个处理阶段都清晰可见。</p></div><div class="heading-actions"><button class="button secondary" id="scanAll">↻ 立即巡检</button><button class="button primary" id="addServiceOpen">＋ 接入服务</button></div></section>
+      <div class="notice hidden" id="connectionNotice" role="status"></div>
+      <section class="hero-banner" id="heroBanner"><div class="hero-symbol">◈</div><div><div class="hero-top"><strong id="heroTitle">等待第一次健康检查</strong><span class="pill subtle" id="diagnosticMode">规则诊断</span></div><p id="heroDescription">正在从控制器读取真实运行状态。</p></div><div class="hero-live"><span class="pulse-dot"></span> 持续观测<small>每 3 秒更新看板</small></div></section>
+      <section class="stats-grid" id="statsGrid" aria-label="运行概览"></section>
+      <div id="overviewContent" class="overview-grid">
+        <section class="panel services-panel" id="servicePanel"><div class="panel-heading"><div><h2>服务健康</h2><p>来自最近一次实际探测</p></div><span class="small-tag" id="serviceCount">0 个服务</span></div><div class="table-scroll"><table><thead><tr><th>服务</th><th>状态</th><th>响应时间</th><th>处置策略</th><th>最近检查</th><th></th></tr></thead><tbody id="serviceRows"></tbody></table></div><div class="panel-foot"><span class="legend-dot"></span>健康状态来自探针；暂停后保留最后观测。<button class="text-button" id="pauseAll">暂停全部巡检</button></div></section>
+        <section class="panel activity-panel" id="activityPanel"><div class="panel-heading"><div><h2>运行动态</h2><p>执行记录与关键变化</p></div><span class="live-label">LIVE</span></div><div id="activityList" class="activity-list"></div></section>
+        <section class="panel incidents-panel" id="incidentPanel"><div class="panel-heading"><div><h2>事故与恢复</h2><p>同一故障持续跟踪，恢复后保留证据</p></div><select id="incidentFilter" aria-label="筛选事故"><option value="all">全部事故</option><option value="active">处理中</option><option value="awaiting_approval">等待决策</option><option value="resolved">已恢复</option></select></div><div id="incidentList" class="incident-list"></div></section>
+        <section class="panel exercise-panel" id="exercisePanel"><div class="panel-heading"><div><h2>验证一次完整恢复</h2><p>在独立的本地 HTTP 进程中注入故障</p></div><span class="pill violet">隔离演练</span></div><div class="exercise-intro"><span>◇</span><p>演练仅操作本项目启动的示例服务。状态来自真实请求和文件，不代表已通过生产验证。</p></div><div id="faultButtons" class="fault-grid"><button data-fault="bad_release"><span>↶</span><strong>坏版本发布</strong><small>触发版本回退</small></button><button data-fault="bad_config"><span>⌘</span><strong>配置不兼容</strong><small>恢复已知配置</small></button><button data-fault="process_exit"><span>⏻</span><strong>进程退出</strong><small>重启受管进程</small></button><button data-fault="log_pressure"><span>▥</span><strong>日志超限</strong><small>轮转演练日志</small></button></div><div class="exercise-bottom"><span id="exerciseHint">等待演练服务就绪</span><button class="text-button" data-fault="recover">重置演练环境</button></div></section>
+      </div>
+      <footer><span>OpsSentinel <span id="footerVersion">0.1.0</span> · 自托管监控与受控恢复</span><span id="lastUpdated">尚未收到观测</span></footer>
+    </main>
+  </div>
+  <dialog id="serviceDialog" class="form-dialog"><form id="serviceForm"><div class="dialog-heading"><div><div class="eyebrow">CONNECT A SERVICE</div><h2>接入你的服务</h2></div><button type="button" class="icon-button" data-close="serviceDialog" aria-label="关闭接入窗口">×</button></div><p class="dialog-intro">HTTP 接入即可开始监测；主机 Agent 接入提供受管动作。</p><label>服务名称<input name="name" required maxlength="80" placeholder="例如：订单 API"></label><label>接入方式<select name="connector" id="connectorType"><option value="http">HTTP · 仅监测</option><option value="agent">Linux 主机 Agent · 监测与受控恢复</option></select></label><label><span id="targetLabel">健康检查 URL</span><input name="target" type="url" required placeholder="http://127.0.0.1:8080/health"></label><div id="agentFields" class="hidden"><label>Agent 服务 ID<input name="agent_service" maxlength="80" placeholder="与主机配置中的服务 ID 一致"></label><label>主机访问令牌<input name="agent_token" type="password" autocomplete="off" placeholder="OPS_AGENT_TOKEN"></label><p class="field-hint">令牌仅发送给本地控制器保存，不会显示在看板中。通过私有网络或 HTTPS 接入主机。</p></div><div class="form-row"><label>巡检间隔（秒）<input name="interval_seconds" type="number" min="5" max="3600" value="15" required></label><label>连续失败阈值<input name="failure_threshold" type="number" min="1" max="20" value="2" required></label></div><div class="inline-note">新服务默认需要批准恢复动作。接入后可在服务策略中开启明确的自动动作。</div><div id="serviceFormError" class="form-error" role="alert"></div><div class="dialog-actions"><button type="button" class="button secondary" data-close="serviceDialog">取消</button><button class="button primary" type="submit">接入并开始巡检</button></div></form></dialog>
+  <dialog id="settingsDialog" class="form-dialog"><form id="settingsForm"><div class="dialog-heading"><div><div class="eyebrow">SERVICE POLICY</div><h2 id="settingsTitle">服务策略</h2></div><button type="button" class="icon-button" data-close="settingsDialog" aria-label="关闭服务策略">×</button></div><div id="settingsFacts" class="settings-facts"></div><label class="switch-row"><span><strong>持续巡检</strong><small>关闭后保留状态，停止自动调查和处置</small></span><input type="checkbox" name="enabled"></label><label>巡检间隔（秒）<input name="interval_seconds" type="number" min="5" max="3600" required></label><h3>允许自动执行的动作</h3><p class="field-hint">未选中的动作会生成具体审批请求。主机自身的允许列表和前置条件仍然生效。</p><div id="actionChoices" class="action-choices"></div><div class="dialog-actions"><button type="button" class="button secondary" data-close="settingsDialog">取消</button><button class="button primary" type="submit">保存策略</button></div></form></dialog>
+  <dialog id="incidentDialog" class="incident-dialog"><div class="dialog-heading"><div><div class="eyebrow">INCIDENT WORKSPACE</div><h2>事故详情</h2></div><button class="icon-button" data-close="incidentDialog" aria-label="关闭事故详情">×</button></div><div id="incidentDetail"></div></dialog>
+  <dialog id="tokenDialog" class="token-dialog"><form id="tokenForm"><div class="dialog-heading"><h2>控制器访问令牌</h2><button type="button" class="icon-button" data-close="tokenDialog" aria-label="关闭令牌窗口">×</button></div><p class="dialog-intro">输入该控制器配置的 OPS_API_TOKEN。令牌仅在当前浏览器会话中保存。</p><label>访问令牌<input id="controllerToken" type="password" autocomplete="off" placeholder="本机未配置令牌时可留空"></label><div class="dialog-actions"><button class="button primary" type="submit">连接控制器</button></div></form></dialog>
+  <dialog id="telemetryDialog" class="incident-dialog"><div class="dialog-heading"><div><div class="eyebrow">LIVE OBSERVATIONS</div><h2 id="telemetryTitle">服务观测</h2></div><button class="icon-button" data-close="telemetryDialog" aria-label="关闭服务观测">×</button></div><div id="telemetryDetail"></div></dialog>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</body></html>

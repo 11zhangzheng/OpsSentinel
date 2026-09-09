@@ -1,0 +1,20 @@
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      OPS_API_TOKEN: "${OPS_API_TOKEN:?Set OPS_API_TOKEN in .env to a long random token}"
+      OPS_ALLOWED_HOSTS: "${OPS_ALLOWED_HOSTS:-}"
+      OPS_MODEL_BASE_URL: "${OPS_MODEL_BASE_URL:-}"
+      OPS_MODEL_API_KEY: "${OPS_MODEL_API_KEY:-}"
+      OPS_MODEL_NAME: "${OPS_MODEL_NAME:-}"
+    volumes:
+      - controller-data:/data
+    restart: unless-stopped
+    init: true
+
+volumes:
+  controller-data:

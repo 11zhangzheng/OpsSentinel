@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+.env.*
+!.env.example
+.opssentinel
+__pycache__
+*.pyc
+.pytest_cache
+*.egg-info
+work
+dist
+build
+*.sqlite*
+*.log

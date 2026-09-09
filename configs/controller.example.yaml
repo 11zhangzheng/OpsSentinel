@@ -1,0 +1,26 @@
+# Load explicitly with: python -m opssentinel --config configs/controller.example.yaml --no-demo
+# Replace the address, then enable this example. HTTP connectors only observe.
+services:
+  - id: example-web
+    name: Example web health
+    connector: http
+    target: http://127.0.0.1:8000/health
+    interval_seconds: 15
+    failure_threshold: 2
+    recovery_threshold: 2
+    auto_actions: []
+    enabled: false
+
+# Optional remote agent example: uncomment after configuring the Linux agent.
+# Set OPS_LINUX_AGENT_TOKEN in the controller's environment, never in this file.
+#  - id: example-linux
+#    name: Example Linux web
+#    connector: agent
+#    target: http://127.0.0.1:9876
+#    agent_service: web
+#    agent_token_env: OPS_LINUX_AGENT_TOKEN
+#    interval_seconds: 15
+#    failure_threshold: 2
+#    recovery_threshold: 2
+#    auto_actions: []
+#    enabled: false

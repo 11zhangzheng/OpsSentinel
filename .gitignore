@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.opssentinel/
+.env
+configs/*.local.yaml
+configs/*.local.yml
+*.sqlite*
+*.log
+coverage.xml
+.coverage
