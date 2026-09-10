@@ -1,0 +1,25 @@
+[Unit]
+Description=OpsSentinel allowlisted host agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/opssentinel
+EnvironmentFile=/etc/opssentinel/agent.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/opssentinel/.venv/bin/python -m opssentinel.host_agent --config /etc/opssentinel/agent.yaml --host 127.0.0.1 --port 9876
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+MemoryMax=200M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

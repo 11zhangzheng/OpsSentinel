@@ -1,0 +1,28 @@
+name: opssentinel-lab
+services:
+  api:
+    image: public.ecr.aws/docker/library/python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+    command: [python, -u, /app/app.py]
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 64
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - /srv/opssentinel-lab/app.py:/app/app.py:ro
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 2
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

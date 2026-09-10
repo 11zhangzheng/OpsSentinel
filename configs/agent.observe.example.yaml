@@ -1,0 +1,11 @@
+# First Linux server: replace the example paths and URLs before starting.
+# No recovery actions are allowed during the initial observation stage.
+state_dir: /srv/opssentinel/state
+services:
+  test_api:
+    compose_file: /srv/myapp/compose.yaml
+    compose_service: api
+    health_url: http://127.0.0.1:8080/health
+    # Remove business_url if the application has no separate readiness endpoint.
+    business_url: http://127.0.0.1:8080/ready
+    allowed_actions: []
