@@ -34,31 +34,31 @@
 
 **Files:** models.py, analyzer.py, store.py, engine.py, connectors.py, host_agent.py; tests/test_grounding.py and existing integration tests.
 **Interfaces:** Analyzer.diagnose keeps existing positional inputs and adds incident_id/persist_run_update keywords; returns compatible diagnosis/action/source/context_key plus grounded diagnosis and agent_run. Store saves append-only run records inside incident documents. EvidenceRecord/Diagnosis are the only new production data model classes.
-- [ ] Write tests for fabricated/cross-run/failed/unseen citations, invalid tool arguments, model grounding rejection, immutable persisted facts and rules fallback.
-- [ ] Run tests RED; implement deterministic extraction/validation and typed source outcomes.
-- [ ] Run focused tests and full suite GREEN; record results and commit.
+- [x] Write tests for fabricated/cross-run/failed/unseen citations, invalid tool arguments, model grounding rejection, immutable persisted facts and rules fallback.
+- [x] Run tests RED; implement deterministic extraction/validation and typed source outcomes.
+- [x] Run focused tests and full suite GREEN; record results and commit.
 
 ## Task 2: M2 Bounded harness and evidence-aware context
 
 **Files:** analyzer.py and tests/test_agent_budget.py.
 **Interfaces:** Pure context projection functions operate on complete exchanges and ledger references. Runtime returns explicit stop_reason, tool_events, usage and duration; cancellation propagates after persistence.
-- [ ] Write tests for oversized logs, pinned facts, paired messages, iteration limits, argument failures, deadlines/cancellation and context exhaustion.
-- [ ] Run RED; implement limits, projections, usage and explicit failures inside existing Analyzer.
-- [ ] Run focused tests and full suite GREEN; record results and commit.
+- [x] Write tests for oversized logs, pinned facts, paired messages, iteration limits, argument failures, deadlines/cancellation and context exhaustion.
+- [x] Run RED; implement limits, projections, usage and explicit failures inside existing Analyzer.
+- [x] Run focused tests and full suite GREEN; record results and commit.
 
 ## Task 3: M3 Bound plans to controlled execution
 
 **Files:** engine.py, store.py, connector_helpers.py, connectors.py, host_agent.py, app.py, static/app.js; existing execution tests plus plan tests.
 **Interfaces:** approve(iid, plan_id); action requests carry expected target fingerprint. Intent persists plan metadata. Existing commands/locks/operation semantics remain.
-- [ ] Write tests for expired/changed plans, target drift, incomplete fingerprints, verification timeout, duplicate and unknown actions.
-- [ ] Run RED; implement plan identity/expiry and target checks, updating existing clients and real contract fixtures.
-- [ ] Run focused tests and full suite GREEN; record results and commit.
+- [x] Write tests for expired/changed plans, target drift, incomplete fingerprints, verification timeout, duplicate and unknown actions.
+- [x] Run RED; implement plan identity/expiry and target checks, updating existing clients and real contract fixtures.
+- [x] Run focused tests and full suite GREEN; record results and commit.
 
 ## Task 4: M4 Evaluation contract and runner
 
 **Files:** one tests/evaluation/run.py, fixtures, evaluation contract tests; small existing report additions if necessary.
 **Interfaces:** Input and oracle are separate; runner uses real Analyzer/Engine contracts. Results include mode/source/stop/citations/evidence/tool counts/actual or estimated tokens/latency. Live recovery is never inferred from replay.
-- [ ] Write tests for all 15 fixture shapes, oracle isolation, correct-but-ungrounded failure, incorrect-but-cited failure and forbidden dispatches.
-- [ ] Run RED; implement runner/scorer and fixtures. Preserve existing live demo/lab constraints.
-- [ ] Run full suite and offline replay contract checks; run real-model evaluation only if credentials/configuration are present, report missing measurements honestly.
-- [ ] Fresh final review, test-first fixes, full suite, then transfer reviewed changes to the original clean checkout for user review. No push/publish.
+- [x] Write tests for all 15 fixture shapes, oracle isolation, correct-but-ungrounded failure, incorrect-but-cited failure and forbidden dispatches.
+- [x] Run RED; implement runner/scorer and fixtures. Preserve existing live demo/lab constraints.
+- [x] Run full suite and offline replay contract checks; run real-model evaluation only if credentials/configuration are present, report missing measurements honestly.
+- [x] Fresh final review, test-first fixes, full suite, then transfer reviewed changes to the original clean checkout for user review. No push/publish.

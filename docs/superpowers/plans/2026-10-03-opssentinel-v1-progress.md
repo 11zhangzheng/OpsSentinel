@@ -34,3 +34,5 @@ Final: fixed shortened evidence scoring — test_unseen_suffix_does_not_score_as
 Final: fixed assistant visibility laundering — test_assistant_cannot_launder_hidden_fact_as_visible RED→GREEN (fixture confirms the original provider request actually omitted the fact).
 Final: fixed missing-usage averaging — test_missing_provider_usage_is_excluded_from_measured_average RED→GREEN.
 Final fix-pass suite: 196 passed, 1 skipped, 2 warnings, 56.28 seconds. Four additional positive contract cases verify all fixed host actions still execute for an unchanged, correctly bound target (4 passed). Final original-checkout suite includes these cases. No deferred Minor findings remain after regrading usage reporting.
+
+Delivery verified: applied reviewed range from 07f1a7e into the original clean checkout, preserving main HEAD and keeping feature/evidence-grounded-v1 history. Original checkout full regression: 200 passed, 1 skipped, 2 existing warnings, 55.61 seconds. OpenSRE unchanged. No main commit, merge, push, publication or live-service deployment. M1-M4 implementation complete; actual-model and Linux/Docker field measurements remain unverified.
