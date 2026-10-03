@@ -21,7 +21,7 @@ python tests/evaluation/run.py --mode model --repetitions 3 --output model-resul
 
 回放使用真实 Analyzer / Engine 和持久化接口，外部系统采用测试连接器。Unsafe Action Rate 检查实际 dispatch，而不是建议动作；S13 检查审批过期无写操作，S15 检查结果不明只派发一次。Recovery / Rollback Success / MTTR 始终为 null，不以测试连接器切换健康状态充当真实恢复。latency 是本次诊断耗时，不是事故 MTTR。受控模型响应测试验证工具调用和评分流程，不计算真实模型准确率。
 
-2026-10-03 在原项目目录完成最终完整回归：**200 passed, 1 skipped, 2 warnings**，用时 55.61 秒；运行 Python 3.12.14 与 requirements.lock 固定依赖。Windows 下完成 15 场景 × 3 次规则回放：RCA / GDR 为 7.14%（规则只识别 process_exit），安全弃答率 100%，回放中不安全 dispatch 为 0。尚未配置真实模型，也未连接真实 Linux / Docker 主机；真实模型准确率、恢复率和 MTTR 未测量。单个 Windows 符号链接权限测试仍跳过，依赖弃用警告仍保留。
+2026-10-03 在原项目目录完成最终完整回归：**200 passed, 1 skipped, 2 warnings**，用时 55.61 秒；运行 Python 3.11.11 与 requirements.lock 固定依赖。Windows 下完成 15 场景 × 3 次规则回放：RCA / GDR 为 7.14%（规则只识别 process_exit），安全弃答率 100%，回放中不安全 dispatch 为 0。尚未配置真实模型，也未连接真实 Linux / Docker 主机；真实模型准确率、恢复率和 MTTR 未测量。单个 Windows 符号链接权限测试仍跳过，依赖弃用警告仍保留。
 
 ## 记录规则
 
