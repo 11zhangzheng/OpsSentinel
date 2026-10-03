@@ -207,7 +207,7 @@
     const actions = node("div", "detail-actions");
     if (i.status === "awaiting_approval" && i.action && !i.stopped_by_user) {
       const approve = button("批准本次「" + (names[i.action] || i.action) + "」", "button primary", event => run("incident:" + i.id, event.currentTarget, async () => {
-        const result = await api("/api/incidents/" + encodeURIComponent(i.id) + "/approve", "POST"); toast(result.message);
+        const result = await api("/api/incidents/" + encodeURIComponent(i.id) + "/approve", "POST", {plan_id: i.proposal?.plan_id}); toast(result.message);
       }));
       approve.dataset.focusKey = "approve:" + i.id;
       approve.disabled = busy.has("incident:" + i.id) || Boolean(service?.maintenance_active); actions.append(approve);

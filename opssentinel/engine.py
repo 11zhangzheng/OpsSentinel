@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 
 from . import __version__
@@ -10,6 +12,7 @@ from .models import ACTIONS, Observation
 from .redact import redact
 from .store import Store, now
 from .telemetry import maintenance_active
+from .connector_helpers import target_fingerprint, policy_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +99,8 @@ class Engine:
         except Exception as exc:
             snapshot = {"healthy": False, "reachable": False,
                         "summary": f"连接器检查未完成（{type(exc).__name__}）", "latency_ms": None,
-                        "checks": [], "metrics": {}, "logs": [], "facts": {}}
+                        "checks": [], "metrics": {}, "logs": [], "facts": {},
+                        "source_status": {"snapshot": "TOOL_TIMEOUT" if isinstance(exc, TimeoutError) else "TOOL_ERROR"}}
         snapshot = redact(snapshot, (service.get("agent_token", ""), self.analyzer.api_key))
         snapshot["observed_at"] = now()
         if service["connector"] == "demo" and self.connectors.enable_demo:
@@ -143,6 +147,10 @@ class Engine:
             self.store.set_next_check(sid, next_stamp)
             service, snapshot = await self._observe(service)
             incident = self.store.active_incident(sid)
+            if incident and incident["status"] == "verifying" and incident.get("verification_deadline_at"):
+                if datetime.now(timezone.utc) >= datetime.fromisoformat(incident["verification_deadline_at"]):
+                    incident = self.store.update_incident(incident["id"], status="escalated")
+                    self.store.event("escalated", "恢复验证期限已到，停止后续自动动作", sid, incident["id"])
             if snapshot["healthy"]:
                 if incident and service["consecutive_successes"] >= service["recovery_threshold"]:
                     confirmed = (incident["status"] == "verifying" and not incident.get("stopped_by_user")
@@ -177,17 +185,37 @@ class Engine:
         try:
             async with self.analysis_slots:
                 diagnosis = await asyncio.wait_for(self.analyzer.diagnose(service, snapshot,
-                              [i for i in self.store.list_incidents() if i["service_id"] == service["id"]]), timeout=35)
+                              [i for i in self.store.list_incidents() if i["service_id"] == service["id"]],
+                              incident_id=incident["id"], persist_run_update=lambda run: self.store.save_agent_run(incident["id"], run)), timeout=35)
         except Exception:
             diagnosis = self.analyzer.rule_diagnosis(service, snapshot)
+            # Missing trusted/persisted evidence must not grant a fallback write.
+            diagnosis.update(action=None, source="rules_fallback", grounding={"status": "FAIL", "errors": ["RUN_UNAVAILABLE"]})
         action = diagnosis.get("action")
         if action not in ACTIONS or service["connector"] == "http":
             action = None
         allowed = snapshot.get("facts", {}).get("allowed_actions")
         if service["connector"] == "agent" and allowed is not None and (not isinstance(allowed, list) or action not in allowed):
             action = None
+        proposal = None
+        if action:
+            try:
+                created = datetime.now(timezone.utc)
+                proposal = {"run_id": diagnosis.get("agent_run", {}).get("run_id"), "action": action,
+                            "incident_id": incident["id"], "service_id": service["id"],
+                            "target_fingerprint": target_fingerprint(snapshot, action),
+                            "policy_fingerprint": policy_fingerprint(service), "created_at": created.isoformat(),
+                            "expires_at": (created+timedelta(seconds=300)).isoformat(),
+                            "supporting_citations": [c for claim in diagnosis.get("grounded_diagnosis", {}).get("claims", [])
+                                                     if claim["kind"] == "action_support" for c in claim["citations"]]}
+                if diagnosis.get("grounding", {}).get("status") != "PASS" or not proposal["supporting_citations"]:
+                    raise ValueError("Missing grounded action support")
+                proposal["plan_id"] = hashlib.sha256(json.dumps(proposal, sort_keys=True).encode()).hexdigest()
+            except (ValueError, TypeError):
+                action, proposal = None, None
         incident = self.store.update_incident(incident["id"], diagnosis=diagnosis["diagnosis"], action=action,
-                         diagnostic_source=diagnosis["source"], context_key=diagnosis.get("context_key", context_key(snapshot)))
+                         diagnostic_source=diagnosis["source"], context_key=diagnosis.get("context_key", context_key(snapshot)),
+                         grounded_diagnosis=diagnosis.get("grounded_diagnosis"), grounding=diagnosis.get("grounding"), proposal=proposal)
         self.store.event("diagnosis", diagnosis["diagnosis"], service["id"], incident["id"])
         if not action:
             self.store.update_incident(incident["id"], status="escalated")
@@ -215,6 +243,10 @@ class Engine:
         if not approved and action not in service["auto_actions"]:
             self.store.update_incident(incident["id"], status="awaiting_approval")
             return
+        proposal = incident.get("proposal")
+        if not proposal or proposal["action"] != action or proposal["policy_fingerprint"] != policy_fingerprint(service) or datetime.now(timezone.utc) >= datetime.fromisoformat(proposal["expires_at"]):
+            self.store.update_incident(incident["id"], status="escalated")
+            raise Conflict("具体处置计划已过期或策略已变化，未执行")
         # Recheck after diagnosis: a model call or approval delay may have made evidence stale.
         service, fresh = await self._observe(service)
         if fresh["healthy"]:
@@ -227,13 +259,23 @@ class Engine:
             if approved:
                 raise Conflict("现场状态已经变化，原批准方案已失效，请查看最新证据")
             return
+        try:
+            same_target = target_fingerprint(fresh, action) == proposal["target_fingerprint"]
+        except ValueError:
+            same_target = False
+        if not same_target or datetime.now(timezone.utc) >= datetime.fromisoformat(proposal["expires_at"]):
+            self.store.update_incident(incident["id"], status="escalated")
+            if approved:
+                raise Conflict("目标身份变化、缺失或批准计划已过期，未执行")
+            return
         evidence = incident.get("evidence", {})
         evidence["before_actions"] = [*evidence.get("before_actions", []), fresh][-self.max_attempts:]
         self.store.update_incident(incident["id"], evidence=evidence)
-        operation_id = self.store.begin_action(incident, action)
+        operation_id = self.store.begin_action(incident, action, proposal=proposal)
         self.store.event("action_started", f"执行 {ACTION_NAMES[action]}；操作编号 {operation_id[:10]}", service["id"], incident["id"])
         try:
-            result = await asyncio.wait_for(self.connectors.execute({**service, "_operation_id": operation_id}, action), timeout=100)
+            result = await asyncio.wait_for(self.connectors.execute({**service, "_operation_id": operation_id,
+                                           "_expected_context_key": proposal["target_fingerprint"], "_plan_id": proposal["plan_id"]}, action), timeout=100)
             if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
                 raise ValueError("Invalid action result")
         except asyncio.CancelledError:
@@ -247,13 +289,15 @@ class Engine:
             result["ok"] = False
         self.store.finish_action(operation_id, result)
         self.store.event("action_result", result.get("summary", "动作已返回"), service["id"], incident["id"])
-        self.store.update_incident(incident["id"], status="verifying" if result["ok"] else "escalated")
+        verify_seconds = max(180, (service["recovery_threshold"]+1)*service["interval_seconds"]+40)
+        self.store.update_incident(incident["id"], status="verifying" if result["ok"] else "escalated",
+                                  verification_deadline_at=(datetime.now(timezone.utc)+timedelta(seconds=verify_seconds)).isoformat() if result["ok"] else None)
         if result["ok"]:
             self.store.event("verification", "动作完成，等待连续新鲜业务探针通过，尚未宣告恢复", service["id"], incident["id"])
         else:
             self.store.event("escalated", "执行失败或结果不明；未重复发出写操作", service["id"], incident["id"])
 
-    async def approve(self, iid):
+    async def approve(self, iid, plan_id):
         incident = self.store.get_incident(iid)
         if not incident:
             raise KeyError(iid)
@@ -261,6 +305,8 @@ class Engine:
             incident = self.store.get_incident(iid)
             if incident["status"] != "awaiting_approval" or not incident["action"]:
                 raise Conflict("事故已不处于待批准状态，请刷新")
+            if not incident.get("proposal") or incident["proposal"]["plan_id"] != plan_id:
+                raise Conflict("批准请求不属于当前具体计划，请刷新")
             service = self.store.get_service(incident["service_id"])
             if maintenance_active(service):
                 raise Conflict("服务处于维护窗口，结束维护后才能批准处置")

@@ -28,7 +28,9 @@ class Signals:
     async def observe(self, service):
         return {"healthy": self.healthy, "reachable": True, "summary": "Business probe",
                 "latency_ms": 10, "metrics": {"memory_percent": self.value},
-                "facts": {"suggested_action": "restart_service", "allowed_actions": ["restart_service"]}}
+                "facts": {"suggested_action": "restart_service", "allowed_actions": ["restart_service"],
+                          "container_id": "monitored-container", "current_image": "example@sha256:"+"a"*64,
+                          "container_created_at": "2026-10-03T00:00:00+00:00"}}
 
     async def execute(self, service, action):
         self.executions.append(action)
@@ -138,7 +140,7 @@ async def test_maintenance_expiry_restarts_counts_and_blocks_approval(system):
     assert incident["status"] == "awaiting_approval"
     await engine.maintenance("svc", minutes=1, reason="inspect")
     with pytest.raises(Conflict, match="维护"):
-        await engine.approve(incident["id"])
+        await engine.approve(incident["id"], incident["proposal"]["plan_id"])
     assert not signals.executions
 
 
@@ -152,7 +154,10 @@ async def test_blocked_actions_do_not_starve_unrelated_probes(system):
 
     async def observe(service):
         return {"healthy": service["id"] == "healthy3", "reachable": True,
-                "facts": {"suggested_action": "restart_service"}}
+                "facts": {"suggested_action": "restart_service",
+                          "container_id": service["id"] + "-container",
+                          "current_image": "example@sha256:" + "a" * 64,
+                          "container_created_at": "2026-10-03T00:00:00+00:00"}}
 
     async def execute(service, action):
         started.append(service["id"])

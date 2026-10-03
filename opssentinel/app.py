@@ -21,6 +21,7 @@ from .connectors import ConnectorManager
 from .engine import Conflict, Engine
 from .models import AlertAcknowledge, DismissRequest, FaultRequest, HttpProbe, MaintenanceRequest, ServiceCreate, ServicePatch
 from .process_lock import ProcessLock
+from .reports import incident_report
 from .store import Store, now
 
 
@@ -221,9 +222,20 @@ def create_app(*, data_dir: Path | str = ".opssentinel", demo=False, api_token=N
         await engine.scan_service(sid, manual=True)
         return {"ok": True, "message": "本次巡检已完成"}
 
+    @application.get("/api/incidents/{iid}/report")
+    async def report(iid: str, request: Request):
+        store = request.app.state.store
+        incident = store.get_incident(iid)
+        if not incident:
+            raise KeyError(iid)
+        return {"markdown": incident_report(incident, store.incident_actions(iid), store.events(iid))}
+
     @application.post("/api/incidents/{iid}/approve")
-    async def approve(iid: str, request: Request):
-        await request.app.state.engine.approve(iid)
+    async def approve(iid: str, body: dict, request: Request):
+        plan_id = body.get("plan_id")
+        if set(body) != {"plan_id"} or not isinstance(plan_id, str) or len(plan_id) != 64 or any(c not in "0123456789abcdef" for c in plan_id):
+            raise HTTPException(422, "批准请求必须指定当前具体 plan_id")
+        await request.app.state.engine.approve(iid, plan_id)
         return {"ok": True, "message": "本次处置已处理，请查看验证状态"}
 
     @application.post("/api/incidents/{iid}/dismiss")

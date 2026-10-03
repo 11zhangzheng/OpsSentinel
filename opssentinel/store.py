@@ -167,6 +167,37 @@ class Store(TelemetryMixin):
             rows = self.db.execute("SELECT document FROM incidents ORDER BY (status='resolved'), rowid DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(r[0]) for r in rows]
 
+    def save_agent_run(self, iid: str, run: dict):
+        """Persist a copied run increment; already-written evidence is immutable."""
+        from .models import EvidenceRecord
+        encoded = json.dumps(run, ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode()) > 262144:
+            raise ValueError("Agent run exceeds 256 KiB")
+        incoming = json.loads(encoded)
+        records = incoming.get("evidence_records", [])
+        for record in records:
+            EvidenceRecord.model_validate(record)
+            if record["incident_id"] != iid or record["run_id"] != run["run_id"]:
+                raise ValueError("Evidence ownership mismatch")
+        with self.lock, self.db:
+            incident = self.get_incident(iid)
+            if not incident:
+                raise KeyError(iid)
+            if any(r["service_id"] != incident["service_id"] for r in records):
+                raise ValueError("Evidence service mismatch")
+            runs = incident.get("agent_runs", [])
+            previous = next((r for r in runs if r["run_id"] == incoming["run_id"]), None)
+            if previous:
+                old = previous.get("evidence_records", [])
+                if records[:len(old)] != old:
+                    raise ValueError("Evidence records are immutable")
+                runs = [incoming if r["run_id"] == incoming["run_id"] else r for r in runs]
+            else:
+                if len(runs) >= 3:
+                    raise ValueError("Incident run budget exhausted")
+                runs = [*runs, incoming]
+            self.update_incident(iid, agent_runs=runs)
+
     def incident_counts(self) -> dict:
         with self.lock:
             return {row[0]: row[1] for row in self.db.execute("SELECT status,COUNT(*) FROM incidents GROUP BY status")}
@@ -184,7 +215,7 @@ class Store(TelemetryMixin):
                 rows = self.db.execute("SELECT * FROM events ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
         return [{k: r[k] for k in r.keys() if k != "seq"} for r in rows]
 
-    def begin_action(self, incident: dict, action: str) -> str:
+    def begin_action(self, incident: dict, action: str, *, proposal=None) -> str:
         """Atomically persist intent and attempt count before issuing a remote write."""
         aid, stamp = new_id(), now()
         with self.lock, self.db:
@@ -194,13 +225,22 @@ class Store(TelemetryMixin):
             self.db.execute("UPDATE incidents SET status=?,document=? WHERE id=?",
                             ("remediating", json.dumps(current), current["id"]))
             self.db.execute("INSERT INTO actions VALUES(?,?,?,?,?)",
-                            (aid, current["id"], action, "running", json.dumps({"started_at": stamp})))
+                             (aid, current["id"], action, "running", json.dumps({"started_at": stamp,
+                              **({"plan_id": proposal["plan_id"], "target_fingerprint": proposal["target_fingerprint"],
+                                  "policy_fingerprint": proposal["policy_fingerprint"]} if proposal else {})})))
         return aid
 
     def finish_action(self, aid: str, result: dict):
         with self.lock, self.db:
+            previous = self.db.execute("SELECT document FROM actions WHERE id=?", (aid,)).fetchone()
+            intent = json.loads(previous[0]) if previous else {}
             self.db.execute("UPDATE actions SET status=?,document=? WHERE id=?",
-                            ("completed" if result.get("ok") else "failed", json.dumps({**result, "finished_at": now()}), aid))
+                            ("completed" if result.get("ok") else "failed", json.dumps({**intent, **result, "finished_at": now()}), aid))
+
+    def incident_actions(self, iid: str) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM actions WHERE incident_id=? ORDER BY rowid", (iid,)).fetchall()
+        return [{**dict(row), "document": json.loads(row["document"])} for row in rows]
 
     def has_confirmed_latest_action(self, iid: str) -> bool:
         """A persisted attempt is not evidence that an action actually succeeded."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -14,16 +15,16 @@ import uuid
 import httpx
 import psutil
 
-from .connector_helpers import ResponseTooLargeError, atomic_json, http_request, tail_lines, validate_agent_base
+from .connector_helpers import ResponseTooLargeError, atomic_json, http_request, tail_lines, validate_agent_base, target_fingerprint
 from .demo_service import LOG_LIMIT
 
 ACTIONS = {"restart_service", "rollback_release", "restore_config", "rotate_logs"}
 
 
-def failure(summary: str) -> dict:
+def failure(summary: str, status: str = "TOOL_ERROR") -> dict:
     return {"healthy": False, "reachable": False, "summary": summary, "latency_ms": None,
             "checks": [{"name": "connection", "ok": False, "detail": summary}],
-            "metrics": {}, "logs": [], "facts": {}}
+            "metrics": {}, "logs": [], "facts": {}, "source_status": {"snapshot": status}}
 
 
 class ConnectorManager:
@@ -112,6 +113,15 @@ class ConnectorManager:
                 "recovery_threshold": 2, "auto_actions": sorted(ACTIONS), "enabled": self.enable_demo,
                 "agent_service": ""}
 
+    def _demo_target_facts(self):
+        release = json.loads((self.demo_dir/"release.json").read_text(encoding="utf-8"))
+        config = (self.demo_dir/"config.json").read_bytes()
+        log = (self.demo_dir/"application.log").stat()
+        return {**release, "exercise_identity": str(self.demo_dir.resolve()),
+                "config_hash": hashlib.sha256(config).hexdigest(),
+                "known_good_config_hash": hashlib.sha256(json.dumps({"mode": "valid"}).encode()).hexdigest(),
+                "managed_log_identity": f"{log.st_dev}:{log.st_ino}"}
+
     async def observe(self, service: dict) -> dict:
         connector = service.get("connector")
         started = time.monotonic()
@@ -133,7 +143,9 @@ class ConnectorManager:
                 return failure("Unsupported connector")
             if connector == "demo" and (not self.enable_demo or self._child is None or self._child.poll() is not None):
                 result = failure("Owned exercise process is stopped")
-                result["facts"] = {"suggested_action": "restart_service", "exercise": True}
+                result["facts"] = {"suggested_action": "restart_service", "exercise": True, "process_running": False}
+                result["facts"].update(self._demo_target_facts())
+                result["source_status"] = {"snapshot": "OK"}
                 result["logs"] = tail_lines(self.demo_dir / "application.log")
                 return result
             if connector == "http":
@@ -152,6 +164,7 @@ class ConnectorManager:
                 result["healthy"] = details.get("healthy") is True and business_code == 200
                 result["checks"].append({"name": "business_http", "ok": business_code == 200, "detail": f"HTTP {business_code}"})
                 result["logs"] = tail_lines(self.demo_dir / "application.log")
+                result["facts"].update(self._demo_target_facts())
             return result
         except Exception as exc:
             # Never return raw exception URLs/headers, which may contain secrets.
@@ -195,6 +208,7 @@ class ConnectorManager:
                     "metrics": {}, "logs": [], "facts": {}}
         except (TimeoutError, httpx.TimeoutException):
             observation = failure(f"HTTP probe exceeded the {float(timeout):g} second timeout")
+            observation["source_status"] = {"snapshot": "OK"}
             observation["checks"][0]["name"] = "timeout"
             observation["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
             return observation
@@ -207,6 +221,8 @@ class ConnectorManager:
         if service.get("connector") == "http":
             return {"ok": False, "summary": "HTTP connector is observe-only", "details": {}}
         if service.get("connector") == "agent":
+            if not service.get("_expected_context_key") or not service.get("_plan_id"):
+                return {"ok": False, "summary": "Missing bound target/plan identity", "details": {}}
             operation = service.get("_operation_id") or uuid.uuid4().hex
             try:
                 base = validate_agent_base(service["target"])
@@ -214,7 +230,8 @@ class ConnectorManager:
                 if not identifier:
                     raise ValueError("Missing service ID")
                 code, body = await http_request(base + "/v1/services/" + identifier + "/actions", method="POST",
-                    token=service.get("agent_token"), payload={"action": action, "operation_id": operation}, timeout=90)
+                    token=service.get("agent_token"), payload={"action": action, "operation_id": operation,
+                    "expected_context_key": service["_expected_context_key"], "plan_id": service["_plan_id"]}, timeout=90)
                 if code != 200:
                     return {"ok": False, "summary": f"Host agent returned HTTP {code}", "details": {"operation_id": operation}}
                 result = json.loads(body)
@@ -237,11 +254,20 @@ class ConnectorManager:
                         return {"ok": False, "summary": "Previous exercise action outcome unknown; inspect before retrying",
                                 "details": {"outcome_unknown": True, "operation_id": operation}}
                     outcome = json.loads(previous[1])
+                    if service.get("_plan_id") and (outcome.get("details", {}).get("plan_id") != service["_plan_id"] or outcome.get("details", {}).get("expected_context_key") != service.get("_expected_context_key")):
+                        return {"ok": False, "summary": "Operation belongs to a different plan", "details": {}}
+                    if outcome.get("pending"):
+                        return {"ok": False, "summary": "Previous action outcome unknown", "details": {"outcome_unknown": True}}
                     outcome["details"]["replayed"] = True
                     return outcome
-                connection.execute("INSERT INTO operations VALUES (?,?,NULL)", (operation, action))
+                if service.get("_expected_context_key"):
+                    if target_fingerprint({"facts": self._demo_target_facts()}, action) != service["_expected_context_key"]:
+                        return {"ok": False, "summary": "Exercise target changed before mutation", "details": {}}
+                intent = {"pending": True, "details": {"plan_id": service.get("_plan_id"), "expected_context_key": service.get("_expected_context_key")}}
+                connection.execute("INSERT INTO operations VALUES (?,?,?)", (operation, action, json.dumps(intent)))
             outcome = await self._execute_demo(action)
             outcome["details"]["operation_id"] = operation
+            outcome["details"].update(plan_id=service.get("_plan_id"), expected_context_key=service.get("_expected_context_key"))
             with sqlite3.connect(self.demo_dir / "operations.sqlite3") as connection:
                 connection.execute("UPDATE operations SET result=? WHERE id=?", (json.dumps(outcome), operation))
             return outcome

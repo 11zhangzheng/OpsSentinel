@@ -2,6 +2,27 @@
 
 本文件区分设计目标、自动化检查与真实部署验证，不把计划当作已经完成的结果。
 
+## 2026-10-03：证据契约与受控处置 v1
+
+M1–M4 在原有 Analyzer / Engine / Store / Host Agent 内实现，没有增加生产模块、数据库表或第二套调度系统。四个调查工具读取本次冻结快照与有限历史，不是实时外部查询。EvidenceRecord 与 Diagnosis 校验引用身份、成功来源、可见事实和声明类型；**结构通过不等于语义蕴含，也不证明深层根因已消除**。可见记录仅来自 Harness 提供的输入和工具结果，模型自写文本不产生证据身份；同时记录实际提供过的事实值或前缀，评分不使用模型未见的账本后半段。
+
+调查最多 4 次模型请求、每次 4 个工具调用；请求 12 秒、调查 35 秒、工具 2 秒。默认上下文 8192，输出预留 1000、安全预留 512，单次调查总预算 32000。预算采用 UTF-8 序列化字节数的保守估算，真实 provider usage 单独统计，缺失时保留缺失标记；实测均值只纳入 usage 完整的调查，单独报告请求测量覆盖率，估算值另列。证据账本与模型上下文分离：上下文可裁剪日志、旧成对交互；被裁掉而从未提供给模型的事实不能被引用。账本保存于原有事故文档，每事故最多 3 次调查；当前实现不恢复半途推理，重启后转人工并保留记录。
+
+处置计划有效期 300 秒，绑定 run / incident / service / action / target / policy 和支持引用。批准 API 现在要求 `{"plan_id":"<当前事故 proposal.plan_id>"}`；Host Agent `/v1/services/{service}/actions` 请求要求原有 action / operation_id 加 `expected_context_key`（完整目标指纹 SHA-256）和 `plan_id`。**升级时控制器与 Host Agent 必须同时更新**，旧客户端缺少字段会得到 422。模型没有写工具权限；四种固定恢复动作仍经独立策略和目标检查。结果不明不重试，也不自动执行补偿写操作；配置恢复仅在尚未派发部署时允许恢复自身文件变更。最多两次处置，验证期限到达后转人工。动作返回成功与连续新鲜业务探针恢复分别记录。容器写操作前重新检查身份，日志轮转绑定实际打开的 descriptor；这些校验减少竞态，不承诺与外部管理员操作或 Docker daemon 达成原子协调。
+
+评测场景位于 [scenarios.yaml](../tests/evaluation/scenarios.yaml)，入口是 [run.py](../tests/evaluation/run.py)。运行方式：
+
+```text
+python tests/evaluation/run.py --mode rules --repetitions 3 --output rules-results.json
+python tests/evaluation/run.py --mode model --repetitions 3 --output model-results.json
+```
+
+模型模式需要在运行环境设置 `OPS_MODEL_API_KEY`、`OPS_MODEL_NAME`，可选 `OPS_MODEL_BASE_URL`、`OPS_MODEL_CONTEXT_TOKENS`；不要把密钥提交到仓库。输入与 oracle 分离。14 个可回答场景计入 RCA/GDR；S14 采集失败场景单独计算安全弃答。GDR 必须同时满足根因正确、必要证据存在、根因声明的有效引用覆盖全部必要事实。证据通过精确 locator、来源、值或预先定义的片段匹配；这套小型合成数据集不代表生产分布。
+
+回放使用真实 Analyzer / Engine 和持久化接口，外部系统采用测试连接器。Unsafe Action Rate 检查实际 dispatch，而不是建议动作；S13 检查审批过期无写操作，S15 检查结果不明只派发一次。Recovery / Rollback Success / MTTR 始终为 null，不以测试连接器切换健康状态充当真实恢复。latency 是本次诊断耗时，不是事故 MTTR。受控模型响应测试验证工具调用和评分流程，不计算真实模型准确率。
+
+2026-10-03 在原项目目录完成最终完整回归：**200 passed, 1 skipped, 2 warnings**，用时 55.61 秒；运行 Python 3.11.11 与 requirements.lock 固定依赖。Windows 下完成 15 场景 × 3 次规则回放：RCA / GDR 为 7.14%（规则只识别 process_exit），安全弃答率 100%，回放中不安全 dispatch 为 0。尚未配置真实模型，也未连接真实 Linux / Docker 主机；真实模型准确率、恢复率和 MTTR 未测量。单个 Windows 符号链接权限测试仍跳过，依赖弃用警告仍保留。
+
 ## 记录规则
 
 每次验收记录日期、系统、Python 版本、执行命令、退出码、关键结果与限制。生成报告时只更新实际执行过的项目。通过模拟对象或本机演练验证的流程，不计为真实 Docker 恢复成功。

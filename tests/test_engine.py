@@ -17,6 +17,7 @@ class FakeConnectors:
         self.executions = []
         self.repaired = repaired
         self.unknown = unknown
+        self.container_id = "managed-container"
 
     async def start(self):
         pass
@@ -27,7 +28,9 @@ class FakeConnectors:
     async def observe(self, service):
         return {"healthy": self.healthy, "reachable": self.healthy, "summary": "Unavailable" if not self.healthy else "OK",
                 "checks": [{"name": "business", "ok": self.healthy, "detail": "HTTP"}],
-                "facts": {} if self.healthy else {"suggested_action": self.suggested},
+                "facts": {} if self.healthy else {"suggested_action": self.suggested,
+                    "container_id": self.container_id, "current_image": "example@sha256:"+"a"*64,
+                    "container_created_at": "2026-10-03T00:00:00+00:00"},
                 "logs": ["password=super-secret"]}
 
     async def execute(self, service, action):
@@ -82,9 +85,9 @@ async def test_policy_approval_is_one_operation_and_duplicate_approval_rejected(
         await engine.scan_service("svc")
     assert len(store.list_incidents()) == 1
     assert not connector.executions
-    await engine.approve(incident["id"])
+    await engine.approve(incident["id"], incident["proposal"]["plan_id"])
     with pytest.raises(Conflict):
-        await engine.approve(incident["id"])
+        await engine.approve(incident["id"], incident["proposal"]["plan_id"])
     assert len(connector.executions) == 1
     assert store.get_service("svc")["auto_actions"] == []
 
@@ -97,7 +100,7 @@ async def test_stale_approval_does_not_execute_prior_plan(harness):
     incident = store.active_incident("svc")
     connector.suggested = "rollback_release"
     with pytest.raises(Conflict):
-        await engine.approve(incident["id"])
+        await engine.approve(incident["id"], incident["proposal"]["plan_id"])
     assert not connector.executions
     assert store.active_incident("svc")["status"] == "escalated"
 
@@ -263,3 +266,14 @@ async def test_critical_evidence_outlives_rolling_observation_history(harness):
     assert incident["evidence"]["initial"]["healthy"] is False
     assert incident["evidence"]["before_actions"][0]["healthy"] is False
     assert incident["evidence"]["recovery"]["healthy"] is True
+
+
+async def test_evidence_persistence_failure_cannot_bypass_grounding(harness):
+    engine, store, connector = harness
+    def unavailable(*args):
+        raise OSError("Evidence disk unavailable")
+    store.save_agent_run = unavailable
+    await engine.scan_service("svc")
+    await engine.scan_service("svc")
+    assert not connector.executions
+    assert store.active_incident("svc")["status"] == "escalated"

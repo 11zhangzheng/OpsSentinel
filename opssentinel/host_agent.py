@@ -29,7 +29,7 @@ import psutil
 import uvicorn
 import yaml
 
-from .connector_helpers import bounded_command, http_request, validate_http_url
+from .connector_helpers import bounded_command, http_request, validate_http_url, target_fingerprint
 
 ACTION_NAMES = {"restart_service", "rollback_release", "restore_config", "rotate_logs"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -41,6 +41,8 @@ class ActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: Literal["restart_service", "rollback_release", "restore_config", "rotate_logs"]
     operation_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]+$")
+    expected_context_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def result(ok: bool, summary: str, **details: object) -> dict:
@@ -235,6 +237,33 @@ class HostRuntime:
         except (OSError, ValueError) as exc:
             return {"eligible": False, "reason": f"Config precondition failed ({type(exc).__name__})"}
 
+    def _target_facts(self, service, container):
+        facts = {"container_id": container.get("id"), "current_image": container.get("current_image"),
+                 "container_created_at": container.get("created_at"), "previous_image": service.get("previous_image"),
+                 "expected_current_image": service.get("expected_current_image"),
+                 "rollback_data_compatible": service.get("rollback_data_compatible")}
+        if service.get("managed_config_path"):
+            config = self._config_evidence(service)
+            facts.update(config_hash=config.get("current_config_sha256"), known_good_config_hash=config.get("known_good_config_sha256"))
+        if service.get("managed_log_path"):
+            try:
+                info = Path(service["managed_log_path"]).lstat()
+                if stat.S_ISREG(info.st_mode):
+                    facts["managed_log_identity"] = f"{info.st_dev}:{info.st_ino}"
+            except OSError:
+                pass
+        return facts
+
+    def _target_matches(self, service, action, container=None):
+        expected = service.get("_expected_context_key")
+        if not expected:
+            return True  # Internal callers; authenticated HTTP requests require the fingerprint.
+        try:
+            facts = self._target_facts(service, container if container is not None else self._container(service))
+            return target_fingerprint({"facts": facts}, action) == expected
+        except (ValueError, OSError):
+            return False
+
     def _rollback_evidence(self, service: dict, container: dict) -> dict:
         previous = service.get("previous_image", "")
         expected = service.get("expected_current_image", "")
@@ -304,19 +333,25 @@ class HostRuntime:
             except (OSError, ValueError):
                 checks.append({"name": "managed_log", "ok": False, "detail": "Configured managed log unavailable"})
         logs = []
+        log_status = "TOOL_ERROR"
         if container.get("known") and container.get("exists"):
             try:
                 log_result = await asyncio.to_thread(bounded_command,
                     self._compose(service) + ["logs", "--no-color", "--tail", "30", service["compose_service"]], timeout=3, limit=8192)
                 if log_result["ok"]:
                     logs = log_result["output"].splitlines()[-30:]
+                    log_status = "OK" if logs else "EMPTY_RESULT"
+                elif log_result["timed_out"]:
+                    log_status = "TOOL_TIMEOUT"
             except OSError:
                 pass
         healthy = all(check["ok"] for check in checks)
         facts = {"current_image": container.get("current_image"), "previous_image": service.get("previous_image"),
                  "expected_current_image": service.get("expected_current_image"), "container_created_at": container.get("created_at"),
-                 "docker_state_known": container.get("known"), "allowed_actions": service["allowed_actions"],
-                 "rollback_data_compatible": service.get("rollback_data_compatible") is True}
+                  "docker_state_known": container.get("known"), "container_running": container.get("running"),
+                  "container_id": container.get("id"), "allowed_actions": service["allowed_actions"],
+                  "rollback_data_compatible": service.get("rollback_data_compatible") is True}
+        facts.update(self._target_facts(service, container))
         config_evidence = await asyncio.to_thread(self._config_evidence, service)
         rollback_evidence = self._rollback_evidence(service, container)
         facts["config_restore"] = config_evidence
@@ -337,15 +372,24 @@ class HostRuntime:
         return {"healthy": healthy, "reachable": any(probe["reachable"] for probe in probes),
                 "summary": "Configured host service healthy" if healthy else "Configured host service failed health checks",
                 "latency_ms": round((time.monotonic() - started) * 1000, 1), "checks": checks,
-                "metrics": metrics, "logs": logs, "facts": facts}
+                "metrics": metrics, "logs": logs, "facts": facts,
+                "source_status": {"snapshot": "OK", "logs": log_status,
+                                  "checks[0]": "OK" if container.get("known") else "TOOL_ERROR",
+                                  "healthy": "OK" if container.get("known") else "TOOL_ERROR",
+                                  "facts": "OK" if container.get("known") else "TOOL_ERROR",
+                                  "metrics": "OK" if metrics else "TOOL_ERROR"}}
 
-    def _existing(self, operation: str, identifier: str, action: str) -> dict | None:
+    def _existing(self, operation: str, identifier: str, action: str, expected_context_key=None, plan_id=None) -> dict | None:
         with self._db() as conn:
             row = conn.execute("SELECT service_id,action,status,result FROM operations WHERE operation_id=?", (operation,)).fetchone()
         if row is None:
             return None
         if row[0] != identifier or row[1] != action:
             raise HTTPException(409, "Operation ID already belongs to a different action")
+        if expected_context_key or plan_id:
+            stored = json.loads(row[3] or "{}").get("details", {})
+            if row[3] and (stored.get("expected_context_key") != expected_context_key or stored.get("plan_id") != plan_id):
+                raise HTTPException(409, "Operation ID already belongs to a different plan/target")
         if row[2] == "completed":
             value = json.loads(row[3])
             value["details"]["replayed"] = True
@@ -353,9 +397,9 @@ class HostRuntime:
         return result(False, "Operation is in progress or its outcome is unknown; inspect before issuing another operation",
                       operation_id=operation, outcome_unknown=True)
 
-    def execute(self, identifier: str, action: str, operation: str) -> dict:
-        service = self._service(identifier)
-        old = self._existing(operation, identifier, action)
+    def execute(self, identifier: str, action: str, operation: str, expected_context_key=None, plan_id=None) -> dict:
+        service = {**self._service(identifier), "_expected_context_key": expected_context_key}
+        old = self._existing(operation, identifier, action, expected_context_key, plan_id)
         if old is not None:
             return old
         if action not in service["allowed_actions"]:
@@ -364,14 +408,15 @@ class HostRuntime:
             return result(False, "Another action is already running for this service", operation_id=operation)
         try:
             # Re-check after the lock: a previous same-ID action may have just finished.
-            old = self._existing(operation, identifier, action)
+            old = self._existing(operation, identifier, action, expected_context_key, plan_id)
             if old is not None:
                 return old
             try:
                 with self._db() as conn:
-                    conn.execute("INSERT INTO operations VALUES (?,?,?,?,?,?)", (operation, identifier, action, "started", None, time.time()))
+                    intent = json.dumps({"details": {"expected_context_key": expected_context_key, "plan_id": plan_id}})
+                    conn.execute("INSERT INTO operations VALUES (?,?,?,?,?,?)", (operation, identifier, action, "started", intent, time.time()))
             except sqlite3.IntegrityError:
-                old = self._existing(operation, identifier, action)
+                old = self._existing(operation, identifier, action, expected_context_key, plan_id)
                 if old is not None:
                     return old
                 return result(False, "Service already has an in-progress or interrupted action; inspect before continuing",
@@ -381,6 +426,7 @@ class HostRuntime:
             except Exception as exc:
                 outcome = result(False, f"Action failed ({type(exc).__name__}); inspect service state", outcome_unknown=True)
             outcome.setdefault("details", {})["operation_id"] = operation
+            outcome["details"].update(expected_context_key=expected_context_key, plan_id=plan_id)
             # A timed-out Docker client does not establish whether the daemon
             # completed a mutation. Retain its service lock for manual inspection.
             status = "started" if outcome["details"].get("outcome_unknown") else "completed"
@@ -391,6 +437,8 @@ class HostRuntime:
             self._locks[identifier].release()
 
     def _perform(self, service: dict, action: str, operation: str) -> dict:
+        if not self._target_matches(service, action):
+            return result(False, "Refused: expected target identity changed or is unavailable")
         if action == "restore_config":
             return self._restore_config(service, operation)
         if action == "rotate_logs":
@@ -428,6 +476,8 @@ class HostRuntime:
             command = self._compose(service) + ["-f", str(override), "up", "-d", "--no-deps", "--no-build", "--pull", "never", service["compose_service"]]
         else:
             return result(False, "Unsupported action")
+        if not self._target_matches(service, action):
+            return result(False, "Refused: target changed during precondition checks")
         execution = bounded_command(command, timeout=45, limit=8192)
         if not execution["ok"]:
             return result(False, "Compose action failed or timed out; inspect before retrying",
@@ -470,11 +520,19 @@ class HostRuntime:
             current, _ = config_snapshot(str(path))
             if current != original:
                 return result(False, "Refused: managed config changed before replacement", archive=archive_name)
+            if not self._target_matches(service, "restore_config"):
+                return result(False, "Refused: approved target changed before config replacement", archive=archive_name)
             replace_config(path, known_good, info)
             replaced = True
             validated = bounded_command(self._compose(service) + ["config", "--quiet"], timeout=10, limit=4096)
             if not validated["ok"]:
                 raise RuntimeError("Fixed Compose configuration validation failed")
+            if service.get("_expected_context_key"):
+                current_container = self._container(service)
+                # Config changed intentionally; the approved container must still be the same.
+                if not current_container.get("known") or not current_container.get("exists") or any(
+                        current_container.get(k) != refreshed.get(k) for k in ("id", "current_image", "created_at")):
+                    raise RuntimeError("Approved container changed before recreation")
             deployment_started = True
             deployed = bounded_command(self._compose(service) + ["up", "-d", "--no-deps", "--no-build", "--pull", "never", "--force-recreate", service["compose_service"]], timeout=40, limit=8192)
             if not deployed["ok"]:
@@ -483,7 +541,7 @@ class HostRuntime:
                           archive=archive_name, verification_required=True, mitigation=True)
         except Exception as exc:
             restored_original = False
-            if replaced:
+            if replaced and not deployment_started:
                 try:
                     current, _ = config_snapshot(str(path))
                     if current == known_good:
@@ -509,15 +567,18 @@ class HostRuntime:
         archives = [path.with_name(path.name + f".{number}") for number in range(1, service["retained_log_count"] + 1)]
         if any(candidate.is_symlink() or (candidate.exists() and not candidate.is_file()) for candidate in archives):
             return result(False, "Refused: archive path is not a regular owned log archive")
-        for source, destination in zip(reversed(archives[:-1]), reversed(archives[1:])):
-            if source.exists():
-                os.replace(source, destination)
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
             opened = os.fstat(descriptor)
             if opened.st_ino != info.st_ino or opened.st_dev != info.st_dev:
                 return result(False, "Refused: managed log changed during precondition checks")
+            expected = service.get("_expected_context_key")
+            if expected and target_fingerprint({"facts": {"managed_log_identity": f"{opened.st_dev}:{opened.st_ino}"}}, "rotate_logs") != expected:
+                return result(False, "Refused: opened log is not the approved target")
+            for source, destination in zip(reversed(archives[:-1]), reversed(archives[1:])):
+                if source.exists():
+                    os.replace(source, destination)
             with os.fdopen(descriptor, "r+b", closefd=False) as original:
                 archive_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
                 archive_fd = os.open(archives[0], archive_flags, 0o600)
@@ -567,7 +628,8 @@ def create_app(config_path: str | Path, token: str | None = None) -> FastAPI:
 
     @app.post("/v1/services/{identifier}/actions", dependencies=[Depends(authorize)])
     async def action(identifier: str, payload: ActionRequest) -> dict:
-        return await asyncio.to_thread(runtime.execute, identifier, payload.action, payload.operation_id)
+        return await asyncio.to_thread(runtime.execute, identifier, payload.action, payload.operation_id,
+                                       payload.expected_context_key, payload.plan_id)
 
     return app
 
