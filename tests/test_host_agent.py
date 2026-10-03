@@ -50,7 +50,8 @@ def test_auth_and_action_schema(config_path, monkeypatch):
         headers = {"Authorization": "Bearer " + TOKEN}
         assert client.post("/v1/services/web/actions", headers=headers, json={"action": "run_shell", "operation_id": "op-000001"}).status_code == 422
         assert client.post("/v1/services/web/actions", headers=headers, json={"action": "restart_service", "operation_id": "op-000001", "command": "rm -rf /"}).status_code == 422
-        assert client.post("/v1/services/unknown/actions", headers=headers, json={"action": "restart_service", "operation_id": "op-000001"}).status_code == 404
+        assert client.post("/v1/services/unknown/actions", headers=headers, json={"action": "restart_service", "operation_id": "op-000001",
+            "expected_context_key": "a"*64, "plan_id": "b"*64}).status_code == 404
 
 
 def test_persistent_idempotency_and_collision(config_path, monkeypatch):

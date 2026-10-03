@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +15,36 @@ import uuid
 import httpx
 
 MAX_BODY = 65536
+
+
+def target_fingerprint(snapshot: dict, action: str) -> str:
+    """Hash required action-specific identities; missing facts fail closed."""
+    facts = snapshot.get("facts", {})
+    if facts.get("exercise_identity"):
+        fields = {"restart_service": ["exercise_identity"],
+                  "rollback_release": ["exercise_identity", "current_image", "previous_image"],
+                  "restore_config": ["exercise_identity", "config_hash", "known_good_config_hash"],
+                  "rotate_logs": ["exercise_identity", "managed_log_identity"]}.get(action)
+    else:
+        base = ["container_id", "current_image", "container_created_at"]
+        fields = {"restart_service": base,
+                  "rollback_release": [*base, "previous_image", "expected_current_image", "rollback_data_compatible"],
+                  "restore_config": [*base, "config_hash", "known_good_config_hash"],
+                  "rotate_logs": ["managed_log_identity"]}.get(action)
+    if not fields or any(facts.get(key) is None or facts.get(key) == "" for key in fields):
+        raise ValueError("Required target identity is unavailable")
+    payload = {key: facts[key] for key in fields}
+    return hashlib.sha256(json.dumps({"action": action, "target": payload}, sort_keys=True).encode()).hexdigest()
+
+
+def policy_fingerprint(service: dict) -> str:
+    fields = ("connector", "target", "agent_service", "enabled", "auto_actions", "http_probe", "maintenance_until",
+              "recovery_threshold", "interval_seconds")
+    policy = {key: service.get(key) for key in fields}
+    policy["auto_actions"] = sorted(policy.get("auto_actions") or [])
+    if service.get("connector") == "demo":
+        policy["target"] = "owned-exercise"  # Ephemeral localhost port; directory identity is target-bound.
+    return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
 
 
 class ResponseTooLargeError(ValueError):

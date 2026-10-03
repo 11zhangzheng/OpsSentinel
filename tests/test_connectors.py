@@ -92,7 +92,8 @@ async def test_agent_connector_reuses_operation_id_and_never_returns_token(tmp_p
     monkeypatch.setattr("opssentinel.connectors.http_request", fake_request)
     manager = ConnectorManager(tmp_path, enable_demo=False)
     service = {"connector": "agent", "target": "http://127.0.0.1:9876", "agent_service": "web",
-               "agent_token": "top-secret-token", "_operation_id": "stable-op-001"}
+               "agent_token": "top-secret-token", "_operation_id": "stable-op-001",
+               "_expected_context_key": "a"*64, "_plan_id": "b"*64}
     await manager.execute(service, "restart_service")
     await manager.execute(service, "restart_service")
     assert [call["payload"]["operation_id"] for call in calls] == ["stable-op-001", "stable-op-001"]

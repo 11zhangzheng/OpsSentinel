@@ -215,7 +215,7 @@ class Store(TelemetryMixin):
                 rows = self.db.execute("SELECT * FROM events ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
         return [{k: r[k] for k in r.keys() if k != "seq"} for r in rows]
 
-    def begin_action(self, incident: dict, action: str) -> str:
+    def begin_action(self, incident: dict, action: str, *, proposal=None) -> str:
         """Atomically persist intent and attempt count before issuing a remote write."""
         aid, stamp = new_id(), now()
         with self.lock, self.db:
@@ -225,13 +225,17 @@ class Store(TelemetryMixin):
             self.db.execute("UPDATE incidents SET status=?,document=? WHERE id=?",
                             ("remediating", json.dumps(current), current["id"]))
             self.db.execute("INSERT INTO actions VALUES(?,?,?,?,?)",
-                            (aid, current["id"], action, "running", json.dumps({"started_at": stamp})))
+                             (aid, current["id"], action, "running", json.dumps({"started_at": stamp,
+                              **({"plan_id": proposal["plan_id"], "target_fingerprint": proposal["target_fingerprint"],
+                                  "policy_fingerprint": proposal["policy_fingerprint"]} if proposal else {})})))
         return aid
 
     def finish_action(self, aid: str, result: dict):
         with self.lock, self.db:
+            previous = self.db.execute("SELECT document FROM actions WHERE id=?", (aid,)).fetchone()
+            intent = json.loads(previous[0]) if previous else {}
             self.db.execute("UPDATE actions SET status=?,document=? WHERE id=?",
-                            ("completed" if result.get("ok") else "failed", json.dumps({**result, "finished_at": now()}), aid))
+                            ("completed" if result.get("ok") else "failed", json.dumps({**intent, **result, "finished_at": now()}), aid))
 
     def has_confirmed_latest_action(self, iid: str) -> bool:
         """A persisted attempt is not evidence that an action actually succeeded."""

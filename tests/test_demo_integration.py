@@ -46,7 +46,7 @@ def test_demo_incident_survives_controller_restart(tmp_path, monkeypatch):
         assert state["incidents"][0]["id"] == incident["id"]
         assert state["incidents"][0]["status"] == "awaiting_approval"
         assert state["services"][0]["auto_actions"] == []
-        assert client.post(f"/api/incidents/{incident['id']}/approve", headers=HEADERS).status_code == 200
+        assert client.post(f"/api/incidents/{incident['id']}/approve", headers=HEADERS, json={"plan_id": incident["proposal"]["plan_id"]}).status_code == 200
         for _ in range(2):
             client.post("/api/services/demo-service/scan", headers=HEADERS)
         assert client.get("/api/state").json()["incidents"][0]["status"] == "resolved"

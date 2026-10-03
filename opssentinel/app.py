@@ -222,8 +222,11 @@ def create_app(*, data_dir: Path | str = ".opssentinel", demo=False, api_token=N
         return {"ok": True, "message": "本次巡检已完成"}
 
     @application.post("/api/incidents/{iid}/approve")
-    async def approve(iid: str, request: Request):
-        await request.app.state.engine.approve(iid)
+    async def approve(iid: str, body: dict, request: Request):
+        plan_id = body.get("plan_id")
+        if set(body) != {"plan_id"} or not isinstance(plan_id, str) or len(plan_id) != 64 or any(c not in "0123456789abcdef" for c in plan_id):
+            raise HTTPException(422, "批准请求必须指定当前具体 plan_id")
+        await request.app.state.engine.approve(iid, plan_id)
         return {"ok": True, "message": "本次处置已处理，请查看验证状态"}
 
     @application.post("/api/incidents/{iid}/dismiss")

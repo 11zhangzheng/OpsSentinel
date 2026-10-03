@@ -112,7 +112,7 @@ def main():
                             raise AssertionError('Unexpected approval or prior action')
                         if command('ps', '--status', 'running', '-q', 'api'):
                             raise AssertionError('Container restarted before approval')
-                        call('POST', '/incidents/' + incident['id'] + '/approve')
+                        call('POST', '/incidents/' + incident['id'] + '/approve', json={'plan_id': incident['proposal']['plan_id']})
                         approved = True
                     if incident['status'] == 'resolved':
                         if incident['resolution_kind'] != 'mitigated' or incident['attempts'] != 1 or current['consecutive_successes'] < 2:

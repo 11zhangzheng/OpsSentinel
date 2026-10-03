@@ -29,7 +29,7 @@ import psutil
 import uvicorn
 import yaml
 
-from .connector_helpers import bounded_command, http_request, validate_http_url
+from .connector_helpers import bounded_command, http_request, validate_http_url, target_fingerprint
 
 ACTION_NAMES = {"restart_service", "rollback_release", "restore_config", "rotate_logs"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -41,6 +41,8 @@ class ActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: Literal["restart_service", "rollback_release", "restore_config", "rotate_logs"]
     operation_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]+$")
+    expected_context_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def result(ok: bool, summary: str, **details: object) -> dict:
@@ -235,6 +237,33 @@ class HostRuntime:
         except (OSError, ValueError) as exc:
             return {"eligible": False, "reason": f"Config precondition failed ({type(exc).__name__})"}
 
+    def _target_facts(self, service, container):
+        facts = {"container_id": container.get("id"), "current_image": container.get("current_image"),
+                 "container_created_at": container.get("created_at"), "previous_image": service.get("previous_image"),
+                 "expected_current_image": service.get("expected_current_image"),
+                 "rollback_data_compatible": service.get("rollback_data_compatible")}
+        if service.get("managed_config_path"):
+            config = self._config_evidence(service)
+            facts.update(config_hash=config.get("current_config_sha256"), known_good_config_hash=config.get("known_good_config_sha256"))
+        if service.get("managed_log_path"):
+            try:
+                info = Path(service["managed_log_path"]).lstat()
+                if stat.S_ISREG(info.st_mode):
+                    facts["managed_log_identity"] = f"{info.st_dev}:{info.st_ino}"
+            except OSError:
+                pass
+        return facts
+
+    def _target_matches(self, service, action, container=None):
+        expected = service.get("_expected_context_key")
+        if not expected:
+            return True  # Internal callers; authenticated HTTP requests require the fingerprint.
+        try:
+            facts = self._target_facts(service, container if container is not None else self._container(service))
+            return target_fingerprint({"facts": facts}, action) == expected
+        except (ValueError, OSError):
+            return False
+
     def _rollback_evidence(self, service: dict, container: dict) -> dict:
         previous = service.get("previous_image", "")
         expected = service.get("expected_current_image", "")
@@ -321,7 +350,8 @@ class HostRuntime:
                  "expected_current_image": service.get("expected_current_image"), "container_created_at": container.get("created_at"),
                   "docker_state_known": container.get("known"), "container_running": container.get("running"),
                   "container_id": container.get("id"), "allowed_actions": service["allowed_actions"],
-                 "rollback_data_compatible": service.get("rollback_data_compatible") is True}
+                  "rollback_data_compatible": service.get("rollback_data_compatible") is True}
+        facts.update(self._target_facts(service, container))
         config_evidence = await asyncio.to_thread(self._config_evidence, service)
         rollback_evidence = self._rollback_evidence(service, container)
         facts["config_restore"] = config_evidence
@@ -349,13 +379,17 @@ class HostRuntime:
                                   "facts": "OK" if container.get("known") else "TOOL_ERROR",
                                   "metrics": "OK" if metrics else "TOOL_ERROR"}}
 
-    def _existing(self, operation: str, identifier: str, action: str) -> dict | None:
+    def _existing(self, operation: str, identifier: str, action: str, expected_context_key=None, plan_id=None) -> dict | None:
         with self._db() as conn:
             row = conn.execute("SELECT service_id,action,status,result FROM operations WHERE operation_id=?", (operation,)).fetchone()
         if row is None:
             return None
         if row[0] != identifier or row[1] != action:
             raise HTTPException(409, "Operation ID already belongs to a different action")
+        if expected_context_key or plan_id:
+            stored = json.loads(row[3] or "{}").get("details", {})
+            if row[3] and (stored.get("expected_context_key") != expected_context_key or stored.get("plan_id") != plan_id):
+                raise HTTPException(409, "Operation ID already belongs to a different plan/target")
         if row[2] == "completed":
             value = json.loads(row[3])
             value["details"]["replayed"] = True
@@ -363,9 +397,9 @@ class HostRuntime:
         return result(False, "Operation is in progress or its outcome is unknown; inspect before issuing another operation",
                       operation_id=operation, outcome_unknown=True)
 
-    def execute(self, identifier: str, action: str, operation: str) -> dict:
-        service = self._service(identifier)
-        old = self._existing(operation, identifier, action)
+    def execute(self, identifier: str, action: str, operation: str, expected_context_key=None, plan_id=None) -> dict:
+        service = {**self._service(identifier), "_expected_context_key": expected_context_key}
+        old = self._existing(operation, identifier, action, expected_context_key, plan_id)
         if old is not None:
             return old
         if action not in service["allowed_actions"]:
@@ -374,14 +408,15 @@ class HostRuntime:
             return result(False, "Another action is already running for this service", operation_id=operation)
         try:
             # Re-check after the lock: a previous same-ID action may have just finished.
-            old = self._existing(operation, identifier, action)
+            old = self._existing(operation, identifier, action, expected_context_key, plan_id)
             if old is not None:
                 return old
             try:
                 with self._db() as conn:
-                    conn.execute("INSERT INTO operations VALUES (?,?,?,?,?,?)", (operation, identifier, action, "started", None, time.time()))
+                    intent = json.dumps({"details": {"expected_context_key": expected_context_key, "plan_id": plan_id}})
+                    conn.execute("INSERT INTO operations VALUES (?,?,?,?,?,?)", (operation, identifier, action, "started", intent, time.time()))
             except sqlite3.IntegrityError:
-                old = self._existing(operation, identifier, action)
+                old = self._existing(operation, identifier, action, expected_context_key, plan_id)
                 if old is not None:
                     return old
                 return result(False, "Service already has an in-progress or interrupted action; inspect before continuing",
@@ -391,6 +426,7 @@ class HostRuntime:
             except Exception as exc:
                 outcome = result(False, f"Action failed ({type(exc).__name__}); inspect service state", outcome_unknown=True)
             outcome.setdefault("details", {})["operation_id"] = operation
+            outcome["details"].update(expected_context_key=expected_context_key, plan_id=plan_id)
             # A timed-out Docker client does not establish whether the daemon
             # completed a mutation. Retain its service lock for manual inspection.
             status = "started" if outcome["details"].get("outcome_unknown") else "completed"
@@ -401,6 +437,8 @@ class HostRuntime:
             self._locks[identifier].release()
 
     def _perform(self, service: dict, action: str, operation: str) -> dict:
+        if not self._target_matches(service, action):
+            return result(False, "Refused: expected target identity changed or is unavailable")
         if action == "restore_config":
             return self._restore_config(service, operation)
         if action == "rotate_logs":
@@ -438,6 +476,8 @@ class HostRuntime:
             command = self._compose(service) + ["-f", str(override), "up", "-d", "--no-deps", "--no-build", "--pull", "never", service["compose_service"]]
         else:
             return result(False, "Unsupported action")
+        if not self._target_matches(service, action):
+            return result(False, "Refused: target changed during precondition checks")
         execution = bounded_command(command, timeout=45, limit=8192)
         if not execution["ok"]:
             return result(False, "Compose action failed or timed out; inspect before retrying",
@@ -480,6 +520,8 @@ class HostRuntime:
             current, _ = config_snapshot(str(path))
             if current != original:
                 return result(False, "Refused: managed config changed before replacement", archive=archive_name)
+            if not self._target_matches(service, "restore_config", refreshed):
+                return result(False, "Refused: approved target changed before config replacement", archive=archive_name)
             replace_config(path, known_good, info)
             replaced = True
             validated = bounded_command(self._compose(service) + ["config", "--quiet"], timeout=10, limit=4096)
@@ -577,7 +619,8 @@ def create_app(config_path: str | Path, token: str | None = None) -> FastAPI:
 
     @app.post("/v1/services/{identifier}/actions", dependencies=[Depends(authorize)])
     async def action(identifier: str, payload: ActionRequest) -> dict:
-        return await asyncio.to_thread(runtime.execute, identifier, payload.action, payload.operation_id)
+        return await asyncio.to_thread(runtime.execute, identifier, payload.action, payload.operation_id,
+                                       payload.expected_context_key, payload.plan_id)
 
     return app
 
