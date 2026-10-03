@@ -18,7 +18,8 @@ async def test_optional_model_uses_read_only_evidence_and_returns_valid_plan(mon
                 "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "get_snapshot", "arguments": "{}"}}]}}]})
         assert payload["messages"][-1]["role"] == "tool"
         evidence = json.loads(payload["messages"][-1]["content"])
-        citations = [{"evidence_id": evidence["evidence_id"], "fact_id": evidence["facts"][0]["fact_id"]}]
+        business = next(f for f in evidence["facts"] if f["kind"] == "business")
+        citations = [{"evidence_id": evidence["evidence_id"], "fact_id": business["fact_id"]}]
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant",
             "content": json.dumps({"root_cause_code": "unknown", "root_cause": "业务检查失败，退出原因仍不确定",
                 "claims": [{"kind": "observation", "claim": "当前检查失败", "citations": citations},
