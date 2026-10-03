@@ -237,6 +237,11 @@ class Store(TelemetryMixin):
             self.db.execute("UPDATE actions SET status=?,document=? WHERE id=?",
                             ("completed" if result.get("ok") else "failed", json.dumps({**intent, **result, "finished_at": now()}), aid))
 
+    def incident_actions(self, iid: str) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM actions WHERE incident_id=? ORDER BY rowid", (iid,)).fetchall()
+        return [{**dict(row), "document": json.loads(row["document"])} for row in rows]
+
     def has_confirmed_latest_action(self, iid: str) -> bool:
         """A persisted attempt is not evidence that an action actually succeeded."""
         with self.lock:
