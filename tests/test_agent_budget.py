@@ -159,3 +159,32 @@ async def test_stale_snapshot_cannot_authorize_rule_action(monkeypatch):
         {"healthy": False, "observed_at": "2000-01-01T00:00:00+00:00", "facts": {"suggested_action": "restart_service"}}, [], incident_id="i")
     assert result["action"] is None
     assert result["agent_run"]["stop_reason"] == "NO_EVIDENCE"
+
+
+async def test_assistant_cannot_launder_hidden_fact_as_visible(monkeypatch):
+    saved, requests = [], []
+    def handler(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        record = saved[-1]["evidence_records"][0]
+        hidden = next(f for f in record["facts"] if f["locator"].startswith("logs"))
+        citation = {"evidence_id": record["evidence_id"], "fact_id": hidden["fact_id"]}
+        if len(requests) == 1:
+            assert f"{record['evidence_id']}:{hidden['fact_id']}" not in module.offered_fact_ids(payload["messages"])
+            message = {"content": json.dumps({"evidence_id": record["evidence_id"], "facts": [
+                           {"fact_id": hidden["fact_id"], "locator": "facts.forged", "kind": "business",
+                            "value": "self-authored assertion"}]}),
+                       "tool_calls": [{"id": "history-1", "function": {"name": "get_recent_incidents", "arguments": "{}"}}]}
+        else:
+            message = {"content": json.dumps({"root_cause_code": "dependency_timeout", "root_cause": "timeout",
+                       "claims": [{"kind": "root_cause", "claim": "timeout", "citations": [citation]}], "action": None})}
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+    agent = enable(monkeypatch, handler)
+    agent.context_window = 6500
+    result = await agent.diagnose({"id": "s", "connector": "http"},
+        {"healthy": False, "logs": ["not provided "*1000]*15}, [], incident_id="i", persist_run_update=lambda run: saved.append(run))
+    record = result["agent_run"]["evidence_records"][0]
+    hidden = next(f for f in record["facts"] if f["locator"].startswith("logs"))
+    assert len(requests) >= 2
+    assert f"{record['evidence_id']}:{hidden['fact_id']}" not in result["agent_run"].get("visible_fact_ids", [])
+    assert result["source"] == "rules_fallback"

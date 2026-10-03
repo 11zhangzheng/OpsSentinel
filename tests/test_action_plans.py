@@ -118,3 +118,91 @@ def test_authenticated_host_request_requires_bound_target_and_plan(config_path):
         response = client.post("/v1/services/web/actions", headers={"Authorization": "Bearer "+TOKEN},
                                json={"action": "restart_service", "operation_id": "unbound-operation"})
         assert response.status_code == 422
+
+
+def test_rotation_descriptor_must_match_approved_inode(config_path, tmp_path, monkeypatch):
+    runtime = HostRuntime(load_config(config_path))
+    log = tmp_path / "managed.log"
+    log.write_bytes(b"approved" * 300)
+    service = {**runtime.services["web"], "managed_log_path": str(log), "max_log_bytes": 1024}
+    monkeypatch.setattr(runtime, "_container", lambda _: {})
+    service["_expected_context_key"] = connector_helpers.target_fingerprint(
+        {"facts": runtime._target_facts(service, {})}, "rotate_logs")
+    rotate = runtime._rotate
+    replacement = b"unapproved replacement" * 200
+
+    def replace_then_rotate(s):
+        log.rename(log.with_suffix(".saved"))
+        log.write_bytes(replacement)
+        return rotate(s)
+
+    monkeypatch.setattr(runtime, "_rotate", replace_then_rotate)
+    outcome = runtime._perform(service, "rotate_logs", "rotation-race")
+    assert not outcome["ok"]
+    assert log.read_bytes() == replacement and not log.with_name("managed.log.1").exists()
+
+
+@pytest.mark.parametrize("boundary", ["archive", "validation"])
+def test_restore_reinspects_container_at_each_mutation(config_path, tmp_path, monkeypatch, boundary):
+    from test_host_agent import prepare_config_restore, recent_container
+    from opssentinel import host_agent
+    runtime = HostRuntime(load_config(config_path))
+    service, managed, _ = prepare_config_restore(runtime, tmp_path)
+    container = {**recent_container(), "id": "approved-container"}
+    monkeypatch.setattr(runtime, "_container", lambda _: dict(container))
+    service["_expected_context_key"] = connector_helpers.target_fingerprint(
+        {"facts": runtime._target_facts(service, container)}, "restore_config")
+
+    async def unhealthy(*args):
+        return {"ok": False}
+
+    monkeypatch.setattr(runtime, "_probe", unhealthy)
+    original_open = host_agent.os.open
+    def archive_open(path, *args, **kwargs):
+        descriptor = original_open(path, *args, **kwargs)
+        if boundary == "archive" and str(path).endswith(".previous"):
+            container["id"] = "replacement-container"
+        return descriptor
+
+    monkeypatch.setattr(host_agent.os, "open", archive_open)
+    commands = []
+    def command(args, **kwargs):
+        commands.append(args)
+        if boundary == "validation" and args[-2:] == ["config", "--quiet"]:
+            container["id"] = "replacement-container"
+        return {"ok": True, "returncode": 0, "timed_out": False, "output": ""}
+
+    monkeypatch.setattr(host_agent, "bounded_command", command)
+    outcome = runtime._perform(service, "restore_config", "restore-race")
+    assert not outcome["ok"]
+    assert managed.read_bytes() == b"mode: broken\n"
+    assert not any("--force-recreate" in argv for argv in commands)
+
+
+@pytest.mark.parametrize("action", ["restart_service", "rollback_release", "restore_config", "rotate_logs"])
+def test_bound_host_actions_still_execute_on_unchanged_target(config_path, tmp_path, monkeypatch, action):
+    from test_host_agent import configure_rollback, prepare_config_restore, recent_container
+    runtime = HostRuntime(load_config(config_path))
+    service = runtime.services["web"]
+    container = {**recent_container(), "id": "unchanged-target", "docker_health": "unhealthy"}
+    configure_rollback(service)
+    managed = None
+    if action == "restore_config":
+        service, managed, _ = prepare_config_restore(runtime, tmp_path)
+    elif action == "rotate_logs":
+        managed = tmp_path / "bound.log"
+        managed.write_bytes(b"x"*2048)
+        service.update(managed_log_path=str(managed), max_log_bytes=1024)
+    monkeypatch.setattr(runtime, "_container", lambda _: dict(container))
+    async def unhealthy(*args):
+        return {"ok": False}
+    monkeypatch.setattr(runtime, "_probe", unhealthy)
+    monkeypatch.setattr("opssentinel.host_agent.bounded_command", lambda *args, **kwargs:
+                        {"ok": True, "returncode": 0, "timed_out": False, "output": ""})
+    expected = connector_helpers.target_fingerprint({"facts": runtime._target_facts(service, container)}, action)
+    outcome = runtime.execute("web", action, "bound-valid-"+action, expected, "b"*64)
+    assert outcome["ok"] and outcome["details"]["verification_required"]
+    if action == "restore_config":
+        assert managed.read_bytes() == b"mode: working\n"
+    elif action == "rotate_logs":
+        assert managed.read_bytes() == b""

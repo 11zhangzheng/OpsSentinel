@@ -210,9 +210,9 @@ def test_restore_config_real_files_and_fixed_compose_commands(config_path, tmp_p
 
 
 @pytest.mark.parametrize("failure_stage", ["validation", "deployment"])
-def test_restore_failure_puts_original_config_back(config_path, tmp_path, monkeypatch, failure_stage):
+def test_restore_failure_compensates_only_before_deployment(config_path, tmp_path, monkeypatch, failure_stage):
     runtime = HostRuntime(load_config(config_path))
-    service, managed, _ = prepare_config_restore(runtime, tmp_path)
+    service, managed, backup = prepare_config_restore(runtime, tmp_path)
     monkeypatch.setattr(runtime, "_container", lambda _: recent_container())
     async def unhealthy(*args):
         return {"ok": False}
@@ -223,8 +223,8 @@ def test_restore_failure_puts_original_config_back(config_path, tmp_path, monkey
     monkeypatch.setattr("opssentinel.host_agent.bounded_command", command)
     outcome = runtime.execute("web", "restore_config", "restore-failure-config")
     assert not outcome["ok"]
-    assert managed.read_bytes() == b"mode: broken\n"
-    assert outcome["details"]["original_file_restored"]
+    assert managed.read_bytes() == (backup.read_bytes() if failure_stage == "deployment" else b"mode: broken\n")
+    assert outcome["details"]["original_file_restored"] == (failure_stage == "validation")
     assert outcome["details"]["outcome_unknown"] == (failure_stage == "deployment")
 
 

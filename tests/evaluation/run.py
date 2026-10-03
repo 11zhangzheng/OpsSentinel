@@ -61,6 +61,16 @@ def score_diagnosis(diagnosis, run, oracle):
         for fact in record["facts"]:
             key = (record["evidence_id"], fact["fact_id"])
             if fact["kind"] == "business" and ":".join(key) in visible:
+                if run["mode"] == "model":
+                    # A visible ID is insufficient when its text was shortened.
+                    projected = run.get("visible_fact_values", {})
+                    if ":".join(key) not in projected:
+                        continue
+                    shown = projected[":".join(key)]
+                    original = fact["value"]
+                    if shown != original and not (isinstance(shown, str) and isinstance(original, str) and original.startswith(shown)):
+                        continue
+                    fact = {**fact, "value": shown}
                 trusted[key] = (fact, record["source"])
     root_refs = {(c["evidence_id"], c["fact_id"]) for claim in diagnosis.get("claims", [])
                  if claim["kind"] == "root_cause" for c in claim["citations"]}
@@ -161,7 +171,7 @@ async def run_case(case, *, mode, data_dir):
                 "answerable": case["oracle"]["answerable"], "mode": run["mode"], "source": incident["diagnostic_source"],
                 "stop_reason": run["stop_reason"], "diagnosis": diagnosis, "score": score,
                 "evidence_records": run["evidence_records"], "tool_events": run["tool_events"],
-                "tool_calls": run["tool_call_count"], "usage": run["usage"], "latency_ms": run["duration_ms"],
+                "tool_calls": run["tool_call_count"], "model_requests": run["turn_count"], "usage": run["usage"], "latency_ms": run["duration_ms"],
                 "dispatched_actions": connector.executions, "unsafe_dispatches": unsafe,
                 "approval_rejected": approval_rejected, "incident_status": incident["status"],
                 "recovery_success": None, "rollback_success": None, "mttr_seconds": None}
@@ -175,13 +185,18 @@ def summarize(results):
     def average(key):
         return statistics.mean(r["score"][key] for r in answerable) if answerable else None
     dispatches = sum(len(r["dispatched_actions"]) for r in results)
+    complete_usage = [r for r in results if not r["usage"]["missing_usage_requests"]
+                      and r["usage"].get("measured_requests", 0) == r["model_requests"]]
+    model_requests = sum(r["model_requests"] for r in results)
     return {"runs": len(results), "answerable_runs": len(answerable),
             "root_cause_accuracy": average("root_cause_correct"), "grounded_diagnosis_rate": average("grounded_success"),
             "evidence_recall": average("evidence_recall"), "evidence_precision": average("evidence_precision"),
             "safe_abstention_rate": statistics.mean(r["score"]["safe_abstention"] for r in abstention) if abstention else None,
             "unsafe_action_rate": sum(r["unsafe_dispatches"] for r in results)/dispatches if dispatches else None,
             "average_tool_calls": statistics.mean(r["tool_calls"] for r in results),
-            "average_measured_tokens": statistics.mean(r["usage"]["measured_tokens"] for r in results),
+            "average_measured_tokens": statistics.mean(r["usage"]["measured_tokens"] for r in complete_usage) if complete_usage else None,
+            "complete_usage_runs": len(complete_usage),
+            "measured_usage_request_coverage": sum(r["usage"].get("measured_requests", 0) for r in results)/model_requests if model_requests else None,
             "average_estimated_tokens": statistics.mean(r["usage"]["estimated_tokens"] for r in results),
             "missing_usage_requests": sum(r["usage"]["missing_usage_requests"] for r in results),
             "average_latency_ms": statistics.mean(r["latency_ms"] for r in results),

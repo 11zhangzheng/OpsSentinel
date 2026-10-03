@@ -520,13 +520,19 @@ class HostRuntime:
             current, _ = config_snapshot(str(path))
             if current != original:
                 return result(False, "Refused: managed config changed before replacement", archive=archive_name)
-            if not self._target_matches(service, "restore_config", refreshed):
+            if not self._target_matches(service, "restore_config"):
                 return result(False, "Refused: approved target changed before config replacement", archive=archive_name)
             replace_config(path, known_good, info)
             replaced = True
             validated = bounded_command(self._compose(service) + ["config", "--quiet"], timeout=10, limit=4096)
             if not validated["ok"]:
                 raise RuntimeError("Fixed Compose configuration validation failed")
+            if service.get("_expected_context_key"):
+                current_container = self._container(service)
+                # Config changed intentionally; the approved container must still be the same.
+                if not current_container.get("known") or not current_container.get("exists") or any(
+                        current_container.get(k) != refreshed.get(k) for k in ("id", "current_image", "created_at")):
+                    raise RuntimeError("Approved container changed before recreation")
             deployment_started = True
             deployed = bounded_command(self._compose(service) + ["up", "-d", "--no-deps", "--no-build", "--pull", "never", "--force-recreate", service["compose_service"]], timeout=40, limit=8192)
             if not deployed["ok"]:
@@ -535,7 +541,7 @@ class HostRuntime:
                           archive=archive_name, verification_required=True, mitigation=True)
         except Exception as exc:
             restored_original = False
-            if replaced:
+            if replaced and not deployment_started:
                 try:
                     current, _ = config_snapshot(str(path))
                     if current == known_good:
@@ -561,15 +567,18 @@ class HostRuntime:
         archives = [path.with_name(path.name + f".{number}") for number in range(1, service["retained_log_count"] + 1)]
         if any(candidate.is_symlink() or (candidate.exists() and not candidate.is_file()) for candidate in archives):
             return result(False, "Refused: archive path is not a regular owned log archive")
-        for source, destination in zip(reversed(archives[:-1]), reversed(archives[1:])):
-            if source.exists():
-                os.replace(source, destination)
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
             opened = os.fstat(descriptor)
             if opened.st_ino != info.st_ino or opened.st_dev != info.st_dev:
                 return result(False, "Refused: managed log changed during precondition checks")
+            expected = service.get("_expected_context_key")
+            if expected and target_fingerprint({"facts": {"managed_log_identity": f"{opened.st_dev}:{opened.st_ino}"}}, "rotate_logs") != expected:
+                return result(False, "Refused: opened log is not the approved target")
+            for source, destination in zip(reversed(archives[:-1]), reversed(archives[1:])):
+                if source.exists():
+                    os.replace(source, destination)
             with os.fdopen(descriptor, "r+b", closefd=False) as original:
                 archive_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
                 archive_fd = os.open(archives[0], archive_flags, 0o600)

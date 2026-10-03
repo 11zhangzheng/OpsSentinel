@@ -82,12 +82,17 @@ def estimate_tokens(payload):
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
-def offered_fact_ids(messages):
-    ids = set()
+def offered_fact_values(messages):
+    """Only harness-authored user/tool records confer visibility, never model prose."""
+    values = {}
     def visit(value):
         if isinstance(value, dict):
             if "evidence_id" in value and isinstance(value.get("facts"), list):
-                ids.update(f"{value['evidence_id']}:{f['fact_id']}" for f in value["facts"])
+                for fact in value["facts"]:
+                    key, shown = f"{value['evidence_id']}:{fact['fact_id']}", fact["value"]
+                    previous = values.get(key)
+                    if key not in values or (isinstance(shown, str) and isinstance(previous, str) and len(shown) > len(previous)):
+                        values[key] = copy.deepcopy(shown)
             else:
                 for child in value.values():
                     visit(child)
@@ -95,11 +100,17 @@ def offered_fact_ids(messages):
             for child in value:
                 visit(child)
     for message in messages:
+        if message.get("role") not in {"user", "tool"}:
+            continue
         try:
             visit(json.loads(message.get("content") or ""))
         except (ValueError, TypeError):
             pass
-    return ids
+    return values
+
+
+def offered_fact_ids(messages):
+    return set(offered_fact_values(messages))
 
 
 def context_record(record, pinned):
@@ -268,7 +279,7 @@ class Analyzer:
                "observed_at": snapshot.get("observed_at", stamp), "started_at": stamp,
                "mode": "model" if self.enabled else "rules_only", "stop_reason": "UNRESOLVED", "stop_detail": None,
                "evidence_records": [], "tool_events": [], "turn_count": 0, "tool_call_count": 0,
-               "usage": {"measured_tokens": 0, "estimated_tokens": 0, "missing_usage_requests": 0}, "duration_ms": 0}
+               "usage": {"measured_tokens": 0, "measured_requests": 0, "estimated_tokens": 0, "missing_usage_requests": 0}, "duration_ms": 0}
         seed = evidence_record(snapshot, run=run, tool_name="get_snapshot", call_id="seed",
                                source_status=snapshot.get("source_status"))
         run["evidence_records"].append(seed)
@@ -338,7 +349,12 @@ class Analyzer:
                         break
                     run["turn_count"] = turn+1
                     run["usage"]["estimated_tokens"] += estimate+1000
-                    visible.update(offered_fact_ids(request_messages))
+                    shown_values = run.setdefault("visible_fact_values", {})
+                    for key, value in offered_fact_values(request_messages).items():
+                        previous = shown_values.get(key)
+                        if key not in shown_values or (isinstance(value, str) and isinstance(previous, str) and len(value) > len(previous)):
+                            shown_values[key] = value
+                    visible.update(shown_values)
                     run["visible_fact_ids"] = sorted(visible)
                     try:
                         response = await asyncio.wait_for(client.post(self.base_url+"/chat/completions", json=payload,
@@ -352,8 +368,9 @@ class Analyzer:
                     response.raise_for_status()
                     body = response.json()
                     usage = body.get("usage") or {}
-                    if isinstance(usage.get("prompt_tokens"), int) and isinstance(usage.get("completion_tokens"), int):
+                    if all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
                         run["usage"]["measured_tokens"] += usage["prompt_tokens"]+usage["completion_tokens"]
+                        run["usage"]["measured_requests"] += 1
                     else:
                         run["usage"]["missing_usage_requests"] += 1
                     message = body["choices"][0]["message"]

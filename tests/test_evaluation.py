@@ -22,6 +22,7 @@ def sample():
                              tool_name="get_snapshot", call_id="seed")
     run["evidence_records"] = [record]
     run["visible_fact_ids"] = sorted(fact_ids([record]))
+    run["visible_fact_values"] = {f"{record['evidence_id']}:{f['fact_id']}": f["value"] for f in record["facts"]}
     run["mode"] = "model"
     diagnosis = {"root_cause_code": "connection_exhaustion", "root_cause": "Pool exhausted",
                  "claims": [{"kind": "root_cause", "claim": "198 of 200 used", "citations": [
@@ -179,3 +180,43 @@ async def test_model_replay_contract_with_controlled_responses(scenario_id, monk
         assert result["tool_calls"] == 1 and result["usage"]["measured_tokens"] == 200
     else:
         assert not requests and result["score"]["safe_abstention"]
+
+
+async def test_unseen_suffix_does_not_score_as_found_evidence(monkeypatch):
+    import httpx
+    import json
+    saved, offered = [], []
+    marker = "DEPENDENCY_REQUIRED_MARKER"
+    def handler(request):
+        offered.append(json.loads(request.content))
+        record = saved[-1]["evidence_records"][0]
+        fact = next(f for f in record["facts"] if f["locator"] == "logs[0]")
+        diagnosis = {"root_cause_code": "dependency_timeout", "root_cause": "Guessed",
+                     "action": None, "claims": [{"kind": "root_cause", "claim": "Guessed",
+                     "citations": [{"evidence_id": record["evidence_id"], "fact_id": fact["fact_id"]}]}]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(diagnosis)}}]})
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    analyzer = Analyzer()
+    analyzer.api_key, analyzer.model = "test-key", "test-model"
+    result = await analyzer.diagnose({"id": "svc", "connector": "agent"},
+        {"healthy": False, "logs": ["normal "*30 + marker]}, [], incident_id="i", persist_run_update=lambda run: saved.append(run))
+    assert marker not in json.dumps(offered)
+    score = runtime().score_diagnosis(result["grounded_diagnosis"], result["agent_run"],
+        {"root_cause": "dependency_timeout", "required_evidence": [{"locator": "logs[0]", "contains": marker}],
+         "optional_evidence": []})
+    assert score["root_cause_correct"] and not score["grounded_success"]
+    assert score["evidence_recall"] == score["citation_coverage"] == 0
+
+
+def test_missing_provider_usage_is_excluded_from_measured_average():
+    module = runtime()
+    def result(total, measured, missing):
+        return {"answerable": True, "score": {"root_cause_correct": True, "grounded_success": True,
+                "evidence_recall": 1, "evidence_precision": 1}, "dispatched_actions": [], "unsafe_dispatches": 0,
+                "tool_calls": 0, "model_requests": 2, "latency_ms": 1,
+                "usage": {"measured_tokens": total, "measured_requests": measured,
+                          "estimated_tokens": 1000, "missing_usage_requests": missing}}
+    summary = module.summarize([result(200, 2, 0), result(80, 1, 1)])
+    assert summary["average_measured_tokens"] == 200
+    assert summary["measured_usage_request_coverage"] == .75
