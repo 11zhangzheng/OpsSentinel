@@ -96,7 +96,8 @@ class Engine:
         except Exception as exc:
             snapshot = {"healthy": False, "reachable": False,
                         "summary": f"连接器检查未完成（{type(exc).__name__}）", "latency_ms": None,
-                        "checks": [], "metrics": {}, "logs": [], "facts": {}}
+                        "checks": [], "metrics": {}, "logs": [], "facts": {},
+                        "source_status": {"snapshot": "TOOL_TIMEOUT" if isinstance(exc, TimeoutError) else "TOOL_ERROR"}}
         snapshot = redact(snapshot, (service.get("agent_token", ""), self.analyzer.api_key))
         snapshot["observed_at"] = now()
         if service["connector"] == "demo" and self.connectors.enable_demo:
@@ -177,9 +178,12 @@ class Engine:
         try:
             async with self.analysis_slots:
                 diagnosis = await asyncio.wait_for(self.analyzer.diagnose(service, snapshot,
-                              [i for i in self.store.list_incidents() if i["service_id"] == service["id"]]), timeout=35)
+                              [i for i in self.store.list_incidents() if i["service_id"] == service["id"]],
+                              incident_id=incident["id"], persist_run_update=lambda run: self.store.save_agent_run(incident["id"], run)), timeout=35)
         except Exception:
             diagnosis = self.analyzer.rule_diagnosis(service, snapshot)
+            # Missing trusted/persisted evidence must not grant a fallback write.
+            diagnosis.update(action=None, source="rules_fallback", grounding={"status": "FAIL", "errors": ["RUN_UNAVAILABLE"]})
         action = diagnosis.get("action")
         if action not in ACTIONS or service["connector"] == "http":
             action = None
@@ -187,7 +191,8 @@ class Engine:
         if service["connector"] == "agent" and allowed is not None and (not isinstance(allowed, list) or action not in allowed):
             action = None
         incident = self.store.update_incident(incident["id"], diagnosis=diagnosis["diagnosis"], action=action,
-                         diagnostic_source=diagnosis["source"], context_key=diagnosis.get("context_key", context_key(snapshot)))
+                         diagnostic_source=diagnosis["source"], context_key=diagnosis.get("context_key", context_key(snapshot)),
+                         grounded_diagnosis=diagnosis.get("grounded_diagnosis"), grounding=diagnosis.get("grounding"))
         self.store.event("diagnosis", diagnosis["diagnosis"], service["id"], incident["id"])
         if not action:
             self.store.update_incident(incident["id"], status="escalated")

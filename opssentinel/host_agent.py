@@ -304,18 +304,23 @@ class HostRuntime:
             except (OSError, ValueError):
                 checks.append({"name": "managed_log", "ok": False, "detail": "Configured managed log unavailable"})
         logs = []
+        log_status = "TOOL_ERROR"
         if container.get("known") and container.get("exists"):
             try:
                 log_result = await asyncio.to_thread(bounded_command,
                     self._compose(service) + ["logs", "--no-color", "--tail", "30", service["compose_service"]], timeout=3, limit=8192)
                 if log_result["ok"]:
                     logs = log_result["output"].splitlines()[-30:]
+                    log_status = "OK" if logs else "EMPTY_RESULT"
+                elif log_result["timed_out"]:
+                    log_status = "TOOL_TIMEOUT"
             except OSError:
                 pass
         healthy = all(check["ok"] for check in checks)
         facts = {"current_image": container.get("current_image"), "previous_image": service.get("previous_image"),
                  "expected_current_image": service.get("expected_current_image"), "container_created_at": container.get("created_at"),
-                 "docker_state_known": container.get("known"), "allowed_actions": service["allowed_actions"],
+                  "docker_state_known": container.get("known"), "container_running": container.get("running"),
+                  "container_id": container.get("id"), "allowed_actions": service["allowed_actions"],
                  "rollback_data_compatible": service.get("rollback_data_compatible") is True}
         config_evidence = await asyncio.to_thread(self._config_evidence, service)
         rollback_evidence = self._rollback_evidence(service, container)
@@ -337,7 +342,12 @@ class HostRuntime:
         return {"healthy": healthy, "reachable": any(probe["reachable"] for probe in probes),
                 "summary": "Configured host service healthy" if healthy else "Configured host service failed health checks",
                 "latency_ms": round((time.monotonic() - started) * 1000, 1), "checks": checks,
-                "metrics": metrics, "logs": logs, "facts": facts}
+                "metrics": metrics, "logs": logs, "facts": facts,
+                "source_status": {"snapshot": "OK", "logs": log_status,
+                                  "checks[0]": "OK" if container.get("known") else "TOOL_ERROR",
+                                  "healthy": "OK" if container.get("known") else "TOOL_ERROR",
+                                  "facts": "OK" if container.get("known") else "TOOL_ERROR",
+                                  "metrics": "OK" if metrics else "TOOL_ERROR"}}
 
     def _existing(self, operation: str, identifier: str, action: str) -> dict | None:
         with self._db() as conn:

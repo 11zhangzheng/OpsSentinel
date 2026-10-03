@@ -167,6 +167,37 @@ class Store(TelemetryMixin):
             rows = self.db.execute("SELECT document FROM incidents ORDER BY (status='resolved'), rowid DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(r[0]) for r in rows]
 
+    def save_agent_run(self, iid: str, run: dict):
+        """Persist a copied run increment; already-written evidence is immutable."""
+        from .models import EvidenceRecord
+        encoded = json.dumps(run, ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode()) > 262144:
+            raise ValueError("Agent run exceeds 256 KiB")
+        incoming = json.loads(encoded)
+        records = incoming.get("evidence_records", [])
+        for record in records:
+            EvidenceRecord.model_validate(record)
+            if record["incident_id"] != iid or record["run_id"] != run["run_id"]:
+                raise ValueError("Evidence ownership mismatch")
+        with self.lock, self.db:
+            incident = self.get_incident(iid)
+            if not incident:
+                raise KeyError(iid)
+            if any(r["service_id"] != incident["service_id"] for r in records):
+                raise ValueError("Evidence service mismatch")
+            runs = incident.get("agent_runs", [])
+            previous = next((r for r in runs if r["run_id"] == incoming["run_id"]), None)
+            if previous:
+                old = previous.get("evidence_records", [])
+                if records[:len(old)] != old:
+                    raise ValueError("Evidence records are immutable")
+                runs = [incoming if r["run_id"] == incoming["run_id"] else r for r in runs]
+            else:
+                if len(runs) >= 3:
+                    raise ValueError("Incident run budget exhausted")
+                runs = [*runs, incoming]
+            self.update_incident(iid, agent_runs=runs)
+
     def incident_counts(self) -> dict:
         with self.lock:
             return {row[0]: row[1] for row in self.db.execute("SELECT status,COUNT(*) FROM incidents GROUP BY status")}

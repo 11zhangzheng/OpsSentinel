@@ -263,3 +263,14 @@ async def test_critical_evidence_outlives_rolling_observation_history(harness):
     assert incident["evidence"]["initial"]["healthy"] is False
     assert incident["evidence"]["before_actions"][0]["healthy"] is False
     assert incident["evidence"]["recovery"]["healthy"] is True
+
+
+async def test_evidence_persistence_failure_cannot_bypass_grounding(harness):
+    engine, store, connector = harness
+    def unavailable(*args):
+        raise OSError("Evidence disk unavailable")
+    store.save_agent_run = unavailable
+    await engine.scan_service("svc")
+    await engine.scan_service("svc")
+    assert not connector.executions
+    assert store.active_incident("svc")["status"] == "escalated"

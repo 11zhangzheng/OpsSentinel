@@ -8,6 +8,117 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, 
 Action = Literal["restart_service", "rollback_release", "restore_config", "rotate_logs"]
 ACTIONS = {"restart_service", "rollback_release", "restore_config", "rotate_logs"}
 
+TOOL_STATUSES = {"OK", "EMPTY_RESULT", "TOOL_ERROR", "TOOL_TIMEOUT", "INVALID_ARGUMENT", "PERMISSION_DENIED"}
+ROOT_CAUSES = {"unknown", "bad_deployment", "dependency_timeout", "connection_exhaustion", "oom",
+               "memory_pressure", "cpu_overload", "disk_full", "configuration_error",
+               "probe_contract_mismatch", "port_conflict", "process_exit", "managed_log_pressure"}
+
+
+class EvidenceRecord(BaseModel):
+    """Trusted, bounded source record; updates must append rather than rewrite."""
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    evidence_id: str
+    incident_id: str
+    service_id: str
+    run_id: str
+    tool_call_id: str
+    tool_name: str
+    source: str
+    observed_at: str
+    collected_at: str
+    status: str
+    facts: list[dict] = Field(default_factory=list, max_length=64)
+    excerpt: str | None = Field(default=None, max_length=2000)
+    truncated: bool = False
+
+    @model_validator(mode="after")
+    def valid_record(self):
+        import json
+        if self.status not in TOOL_STATUSES:
+            raise ValueError("Invalid source status")
+        ids = set()
+        for fact in self.facts:
+            if set(fact) != {"fact_id", "locator", "kind", "value"} or fact["kind"] not in {"business", "policy", "historical", "operational"}:
+                raise ValueError("Invalid evidence fact")
+            if not isinstance(fact["fact_id"], str) or fact["fact_id"] in ids or not isinstance(fact["locator"], str):
+                raise ValueError("Invalid or duplicate fact ID")
+            ids.add(fact["fact_id"])
+        if len(json.dumps(self.model_dump(), ensure_ascii=False, allow_nan=False).encode()) > 8192:
+            raise ValueError("Evidence record exceeds 8 KiB")
+        return self
+
+
+class Diagnosis(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    root_cause_code: str
+    root_cause: str = Field(min_length=1, max_length=1500)
+    claims: list[dict] = Field(default_factory=list, max_length=8)
+    hypotheses: list[str] = Field(default_factory=list, max_length=4)
+    action: Action | None = None
+    limitations: list[str] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def valid_claim_shape(self):
+        if self.root_cause_code not in ROOT_CAUSES:
+            raise ValueError("Unknown root cause code")
+        for claim in self.claims:
+            if set(claim) != {"kind", "claim", "citations"} or claim["kind"] not in {"observation", "root_cause", "action_support"}:
+                raise ValueError("Invalid claim shape")
+            if not isinstance(claim["claim"], str) or not claim["claim"].strip() or len(claim["claim"]) > 1500:
+                raise ValueError("Invalid claim text")
+            citations = claim["citations"]
+            if not isinstance(citations, list) or len(citations) > 16:
+                raise ValueError("Invalid citations")
+            for citation in citations:
+                if not isinstance(citation, dict) or set(citation) != {"evidence_id", "fact_id"} or not all(isinstance(v, str) for v in citation.values()):
+                    raise ValueError("Invalid citation")
+        if any(len(text) > 1500 for text in [*self.hypotheses, *self.limitations]):
+            raise ValueError("Diagnostic text exceeds limit")
+        return self
+
+
+def validate_grounding(candidate: dict, records: list[dict], *, incident_id: str, run_id: str,
+                       service_id: str, visible_fact_ids: set[str]) -> dict:
+    """Validate structure/provenance only; this does not prove semantic entailment."""
+    try:
+        diagnosis = Diagnosis.model_validate(candidate)
+    except (ValueError, TypeError):
+        return {"status": "FAIL", "errors": ["INVALID_DIAGNOSIS_SCHEMA"]}
+    evidence = {r["evidence_id"]: r for r in records}
+    errors = []
+    kinds = {c["kind"] for c in diagnosis.claims}
+    if diagnosis.root_cause_code != "unknown" and "root_cause" not in kinds:
+        errors.append("MISSING_ROOT_CAUSE_CLAIM")
+    if diagnosis.action and "action_support" not in kinds:
+        errors.append("MISSING_ACTION_SUPPORT")
+    for claim in diagnosis.claims:
+        if not claim["citations"]:
+            errors.append("UNGROUNDED_CLAIM")
+        business = False
+        for citation in claim["citations"]:
+            record = evidence.get(citation["evidence_id"])
+            if record is None:
+                errors.append("UNKNOWN_EVIDENCE_ID")
+                continue
+            if record["incident_id"] != incident_id or record["service_id"] != service_id:
+                errors.append("CROSS_INCIDENT_REFERENCE")
+            if record["run_id"] != run_id:
+                errors.append("CROSS_RUN_REFERENCE")
+            if record["status"] != "OK":
+                errors.append("FAILED_SOURCE_REFERENCE")
+            fact = next((f for f in record["facts"] if f["fact_id"] == citation["fact_id"]), None)
+            if fact is None:
+                errors.append("UNKNOWN_FACT_ID")
+                continue
+            if f"{record['evidence_id']}:{fact['fact_id']}" not in visible_fact_ids:
+                errors.append("UNSEEN_REFERENCE")
+            business |= fact["kind"] == "business"
+            if fact["kind"] == "operational":
+                errors.append("FAILED_SOURCE_REFERENCE")
+        if claim["kind"] in {"root_cause", "action_support"} and not business:
+            errors.append("UNGROUNDED_CLAIM")
+    return {"status": "FAIL" if errors else "PASS", "errors": sorted(set(errors))}
+
 
 class HttpProbe(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -54,6 +165,14 @@ class Observation(BaseModel):
     metrics: dict[str, float | None] = Field(default_factory=dict)
     logs: list[str] = Field(default_factory=list, max_length=100)
     facts: dict = Field(default_factory=dict)
+    source_status: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("source_status")
+    @classmethod
+    def valid_source_status(cls, value):
+        if any(status not in TOOL_STATUSES for status in value.values()):
+            raise ValueError("Invalid observation source status")
+        return value
 
 
 class ServiceCreate(BaseModel):

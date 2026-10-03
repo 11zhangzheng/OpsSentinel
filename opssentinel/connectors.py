@@ -20,10 +20,10 @@ from .demo_service import LOG_LIMIT
 ACTIONS = {"restart_service", "rollback_release", "restore_config", "rotate_logs"}
 
 
-def failure(summary: str) -> dict:
+def failure(summary: str, status: str = "TOOL_ERROR") -> dict:
     return {"healthy": False, "reachable": False, "summary": summary, "latency_ms": None,
             "checks": [{"name": "connection", "ok": False, "detail": summary}],
-            "metrics": {}, "logs": [], "facts": {}}
+            "metrics": {}, "logs": [], "facts": {}, "source_status": {"snapshot": status}}
 
 
 class ConnectorManager:
@@ -133,7 +133,8 @@ class ConnectorManager:
                 return failure("Unsupported connector")
             if connector == "demo" and (not self.enable_demo or self._child is None or self._child.poll() is not None):
                 result = failure("Owned exercise process is stopped")
-                result["facts"] = {"suggested_action": "restart_service", "exercise": True}
+                result["facts"] = {"suggested_action": "restart_service", "exercise": True, "process_running": False}
+                result["source_status"] = {"snapshot": "OK"}
                 result["logs"] = tail_lines(self.demo_dir / "application.log")
                 return result
             if connector == "http":
@@ -195,6 +196,7 @@ class ConnectorManager:
                     "metrics": {}, "logs": [], "facts": {}}
         except (TimeoutError, httpx.TimeoutException):
             observation = failure(f"HTTP probe exceeded the {float(timeout):g} second timeout")
+            observation["source_status"] = {"snapshot": "OK"}
             observation["checks"][0]["name"] = "timeout"
             observation["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
             return observation
